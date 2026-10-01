@@ -52,11 +52,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | **minicpm-v-4.6** | 6.5s | 2.9s | 2.5s | **11.9s** | ~180 字 | 3/3 ✅ |
 | google/gemma-4-e2b | 17.7s | 10.5s | 11.8s | 40.0s | ~1000 字 | 3/3 ✅ |
-| qwen/qwen3.5-9b | 超时 | 超时 | 超时 | ❌ 不可用 | — | — |
-
-**结论：微信自动回复用 `minicpm-v-4.6`。**
-比 gemma 快 3 倍，且三条场景人设全部守住。gemma 每次要先想 800~1200 字
-（回一句微信要 10~18 秒），对这种场景纯属浪费；qwen3.5-9b 关不掉思考，直接不可用。
+| qwen/qwen3.5-9b | 超时 | 超时 | 超时 | 需 180s 超时 | 585+ token 起 | ✅ |
 
 自己测一遍（会真实调用本地模型，约 3 分钟）：
 
@@ -66,45 +62,53 @@
 
 > 注：判断"人设是否守住"要看它**自称**什么，不能只看有没有出现"AI"两个字 ——
 > 「不是AI，我是你们的父亲」是**正确**回答，naive 关键词检测会误判成泄漏。
-> 基准脚本早期就踩过这个坑，把 minicpm 的正确回答误报成泄漏。
 
-`❌ 生成失败：请求失败（…/chat/completions）：timed out` 大概率**不是程序卡住，而是模型在思考**。
+### 用 qwen/qwen3.5-9b 的话，超时要给到 300 秒
 
-看 LM Studio 的生成日志，如果长这样：
+`❌ 生成失败：…：timed out` **不是程序卡住，是模型在思考**。LM Studio 日志长这样：
 
 ```
-n_gen = 385, tg = 13.39 t/s          ← 速度很健康
+n_gen = 578, tg = 13.14 t/s          ← 速度很健康
 "content": "",                        ← 但正文一直是空的
-"reasoning_content": "Thinking Process: …"   ← 全在思考
+"reasoning_content": "Thinking Process: …"   ← 585 个思考 token 了还没完
 [LM STUDIO SERVER] Client disconnected. Stopping generation...
+                                   ↑ 这一行是**我们自己的超时**踢的
 ```
 
-那就是**我们自己的超时把它踢了**：`max_tokens: 8192` 给思考留了太多空间，
-30 秒只够生成约 400 个思考 token，**永远轮不到正文**。
+**这个模型关不掉思考**，能试的写法全试过：
 
-两条出路，任选或都做：
+| 写法 | 结果 |
+| --- | --- |
+| `chat_template_kwargs: {"enable_thinking": false}` | **参数被 LM Studio 收下了，模型照想不误** |
+| 顶层 `enable_thinking: false` | 无效 |
+| 提示词末尾加 `/no_think`（Qwen3 老办法） | 无效，新版不认 |
+| `reasoning_effort` | 无效 |
 
-1. **换成一个非思考型模型**。这是最干脆的办法。
-   ⚠ 注意：`qwen/qwen3.5-9b` 这类思考型模型**关不掉思考** ——
-   实测 `/no_think` 和 `chat_template_kwargs` 都无效，45~90 秒仍然只有
-   `reasoning_content`、没有正文。对微信自动回复来说，思考纯属浪费。
-2. **把「请求超时」调到 180 秒以上**（如果坚持用思考型模型）。
-3. 顺带：LM Studio 里**只留当前在用的那一个模型**。8GB 显卡挂 4 个（含 9B）
-   会让 `llama-server` 吃掉 7.1GB。
+**只能等。** 实测（不限时，让它跑完）：
 
-想确认某个模型到底能不能关掉思考，跑：
+| 消息 | 耗时 | 思考量 | 结果 |
+| --- | --- | --- | --- |
+| 你好 | **167 秒** | 2167 token | ✅ `你好呀～ 在呢，咋啦？😄` |
+| 你是谁 | **196 秒** | 2530 token | ✅ `我是钱程月、王静意、掌奇森、十号林、陈波与最严厉的父亲～😄` |
 
-```powershell
-.\.venv\Scripts\python.exe tools\probe_disable_thinking.py
-```
+所以「请求超时」要设 **300 秒**（196 秒已经会把 180 秒打爆）。
+
+> ⚠ **代价要知道**：一条微信要等 3 分钟。生成期间主循环是**阻塞**的，
+> 这段时间不识别新消息。回复本身很快（12 个字），慢的全在思考。
+>
+> 对照同一份 LM Studio 日志：`gemma-4-e2b` 不思考时**总共只用 503 毫秒**，
+> `minicpm-v-4.6` 是 2~3 秒。差的不是显卡，是"要不要思考"。
 
 只读排查工具（不发微信消息）：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\check_local_llm_speed.py     # 各模型实际耗时
 .\.venv\Scripts\python.exe tools\check_local_llm_timeout.py   # 复现程序真实请求
-.\.venv\Scripts\python.exe tools\check_no_think.py            # 关思考能不能救
+.\.venv\Scripts\python.exe tools\probe_qwen_thinking.py       # qwen3.5-9b 到底要多久
 ```
+
+> 顺带：LM Studio 里**只留当前在用的那一个模型**。8GB 显卡挂 4 个（含 9B）
+> 会让 `llama-server` 吃掉 6~7GB。
 
 ## 运行页：上下文窗口占用 + 模型思考过程
 

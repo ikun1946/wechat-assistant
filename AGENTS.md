@@ -362,23 +362,49 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 ```powershell
 .\.venv\Scripts\python.exe tools\check_local_llm_speed.py    # 各模型实际耗时
 .\.venv\Scripts\python.exe tools\check_local_llm_timeout.py  # 复现程序真实请求
-.\.venv\Scripts\python.exe tools\check_no_think.py            # 关思考能不能救
+.\.venv\Scripts\python.exe tools\probe_qwen_thinking.py      # qwen3.5-9b 到底要多久
 ```
 
 **先看 LM Studio 的生成日志，别急着改超时。** 判读要点：
 
 - `n_gen` 一直涨、`tg = 13~14 t/s`，但 `content` 始终是 `""`、
   `reasoning_content` 越来越长 → **模型在思考，不是卡死**。
-  此时 `Client disconnected. Stopping generation...` 是**我们自己的 30 秒超时**踢的。
+  此时 `Client disconnected. Stopping generation...` 是**我们自己的超时**踢的。
 - 根因是 `max_tokens: 8192` 给思考留了太多空间（实测 30 秒只够 ~400 reasoning token，
   永远轮不到正文）。
-- **但关不掉思考就别指望调参了**：`qwen/qwen3.5-9b` 在 LM Studio 上
-  `/no_think` 和 `chat_template_kwargs={"enable_thinking": false}` **都无效**
-  （实测 45~90 秒仍无正文）。思考型模型就是先想完才吐字。
-  **判断某个模型能不能关思考，跑 `tools/probe_disable_thinking.py`**，
-  不行就换非思考型模型 —— 对微信自动回复来说思考纯属浪费。
-- 附带因素：同时加载 4 个模型时 `llama-server` 吃 7.1GB（8GB 显卡），
-  但**这不是主因** —— 13.7 t/s 的生成速度其实很健康。
+
+### ⚠ qwen/qwen3.5-9b 关不掉思考（2026-10-01 实测；用户确认仍要用它）
+
+**能发的都试过了，模型一律无视：**
+
+| 写法 | 结果 |
+| --- | --- |
+| `chat_template_kwargs: {"enable_thinking": false}` | **参数被 LM Studio 接受，模型照想不误** |
+| 顶层 `enable_thinking: false` | 无效 |
+| 系统提示词末尾加 `/no_think` | 无效（Qwen3 老办法，新版不认） |
+| `reasoning_effort` | 无效 |
+
+**不限时实测，它其实能答对，只是要 3 分钟：**
+
+| 消息 | 耗时 | 思考量 | 结果 |
+| --- | --- | --- | --- |
+| 你好 | 167 s | 2167 token | ✅ `你好呀～ 在呢，咋啦？😄` |
+| 你是谁 | 196 s | 2530 token | ✅ 完整人设答对 |
+
+**结论**：`timeout_sec` 必须 **≥ 300 秒**（196 秒就会把 180 打爆）。
+生成期间主循环**阻塞**，这段时间不识别新消息 —— 这是选这个模型的固有代价，
+用户知情后仍选择保留，**别再劝换**。
+
+对照（同一份 LM Studio 日志）：
+
+- `gemma-4-e2b` 不思考时：prompt 341ms + eval 162ms = **总计 503ms**
+- `minicpm-v-4.6`：2.1~2.9s，思考 112~136 token
+- `qwen3.5-9b`：2200~2500 thinking token，13.5 t/s → **167~196 秒**
+
+排查本地模型超时，先看 LM Studio 里加载了几个模型 —— 8GB 显卡只该常驻 1~2 个
+（但这不是主因，13.5 t/s 的生成速度其实很健康）。
+
+> 跑测试前先确认没有后台探测在占用 GPU —— 资源被抢时会有 3~4 项计时相关测试抖动。
 
 ## 下一步（按顺序）
 
