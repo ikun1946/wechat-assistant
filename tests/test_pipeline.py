@@ -1,4 +1,4 @@
-"""回复流水线单元测试。"""
+﻿"""回复流水线单元测试。"""
 
 from __future__ import annotations
 
@@ -149,6 +149,60 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.handle(IncomingMessage(chat_name="张三", text="在干嘛"))
         self.assertEqual(result.action, "skipped")
         self.assertIn("拦截", result.reason)
+
+    # ---------- 记忆只在"真的处理了"时才写（v2.5.1 回归） ----------
+    def test_failed_generation_does_not_pollute_memory(self):
+        """生成失败绝不能把用户消息写进记忆。
+
+        回归：早期版本在取完历史就写记忆，于是每次重试都塞一遍 ——
+        重试 3 次后提示词里出现 4 条「你好」，越重试越长越乱。
+        """
+        cfg = make_config("llm")
+        calls = {"n": 0}
+
+        def flaky_generator(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise LLMError("timed out")
+            return "在的～"
+
+        pipeline, memory = self.make_pipeline(cfg, generator=flaky_generator)
+        for _ in range(2):
+            result = pipeline.handle(IncomingMessage(chat_name="张三", text="你好"))
+            self.assertEqual(result.action, "error")
+
+        self.assertEqual(
+            memory.recent("张三", 10), [], "两次失败后记忆里不该有任何东西"
+        )
+
+        result = pipeline.handle(IncomingMessage(chat_name="张三", text="你好"))
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(
+            [text for _role, text in memory.recent("张三", 10)],
+            ["你好"],
+            "成功那一次才记一条，且只记一条",
+        )
+
+    def test_blocked_reply_does_not_pollute_memory(self):
+        """被安全技能拦下的回复，同样不该留下记忆。"""
+        cfg = make_config("llm")
+        cfg.skills.safety.banned_topics = ("验证码",)
+
+        def risky_generator(*args, **kwargs):
+            return "把验证码发我"
+
+        pipeline, memory = self.make_pipeline(cfg, generator=risky_generator)
+        result = pipeline.handle(IncomingMessage(chat_name="张三", text="在干嘛"))
+        self.assertEqual(result.action, "skipped")
+        self.assertEqual(memory.recent("张三", 10), [])
+
+    def test_denied_message_not_recorded(self):
+        """白名单拦截的消息不该进记忆。"""
+        cfg = make_config("llm")
+        pipeline, memory = self.make_pipeline(cfg, generator=lambda *a, **k: "在的")
+        result = pipeline.handle(IncomingMessage(chat_name="陌生人", text="在吗"))
+        self.assertEqual(result.action, "denied")
+        self.assertEqual(memory.recent("陌生人", 10), [])
 
     # ---------- 自学习技能 ----------
     def test_learned_prompt_injection(self):

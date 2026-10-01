@@ -22,20 +22,58 @@
 
 ## 本地模型超时怎么排查
 
-`❌ 生成失败：请求失败（…/chat/completions）：timed out` 最常见的原因不是代码，是**本地服务被拖垮**：
+`❌ 生成失败：请求失败（…/chat/completions）：timed out` 大概率**不是程序卡住，而是模型在思考**。
 
-1. **LM Studio 里同时加载了几个模型？** 8GB 显卡只该常驻 1~2 个。
-   实测同时挂 4 个（含一个 9B）时 `llama-server` 吃掉 7.1GB，同一句"你好"
-   `minicpm-v-4.6` 要 7~12 秒、`gemma-4-e2b` 要 16~30 秒，直接顶穿超时。
-2. **「思考等级」是 auto 吗？** 思考型模型会先烧 token 再回答，输出预算太小会返回空内容。
-3. **超时设 30 秒够吗？** 本地 9B 建议 60~90 秒。
+看 LM Studio 的生成日志，如果长这样：
 
-自检工具（只读探测，不发微信消息）：
+```
+n_gen = 385, tg = 13.39 t/s          ← 速度很健康
+"content": "",                        ← 但正文一直是空的
+"reasoning_content": "Thinking Process: …"   ← 全在思考
+[LM STUDIO SERVER] Client disconnected. Stopping generation...
+```
+
+那就是**我们自己的超时把它踢了**：`max_tokens: 8192` 给思考留了太多空间，
+30 秒只够生成约 400 个思考 token，**永远轮不到正文**。
+
+两条出路，任选或都做：
+
+1. **换成一个非思考型模型**。这是最干脆的办法。
+   ⚠ 注意：`qwen/qwen3.5-9b` 这类思考型模型**关不掉思考** ——
+   实测 `/no_think` 和 `chat_template_kwargs` 都无效，45~90 秒仍然只有
+   `reasoning_content`、没有正文。对微信自动回复来说，思考纯属浪费。
+2. **把「请求超时」调到 180 秒以上**（如果坚持用思考型模型）。
+3. 顺带：LM Studio 里**只留当前在用的那一个模型**。8GB 显卡挂 4 个（含 9B）
+   会让 `llama-server` 吃掉 7.1GB。
+
+想确认某个模型到底能不能关掉思考，跑：
+
+```powershell
+.\.venv\Scripts\python.exe tools\probe_disable_thinking.py
+```
+
+只读排查工具（不发微信消息）：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\check_local_llm_speed.py     # 各模型实际耗时
 .\.venv\Scripts\python.exe tools\check_local_llm_timeout.py   # 复现程序真实请求
+.\.venv\Scripts\python.exe tools\check_no_think.py            # 关思考能不能救
 ```
+
+## 记忆体检
+
+对话记忆会把**之前的回复当成 few-shot 示例**喂回给模型，所以脏数据会直接教坏模型。
+
+```powershell
+.\.venv\Scripts\python.exe tools\check_memory_hygiene.py     # 体检：泄露身份 / 截断半句 / 重复
+.\.venv\Scripts\python.exe tools\clean_memory.py             # 预览清理
+.\.venv\Scripts\python.exe tools\clean_memory.py --apply     # 执行（自动备份）
+```
+
+会清理三类：**自称助手/AI 的旧回复**（必须删，否则模型跟着学）、
+**换行气泡被拆开的截断半句**、**生成失败重试时重复记入的同一条消息**。
+
+程序侧也已修正：**只有真的产出回复了才写记忆**，失败重试不会再把消息一遍遍塞进去。
 
 ## 记忆（AI 的"上下文记忆"）
 

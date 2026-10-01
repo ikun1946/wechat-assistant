@@ -283,17 +283,49 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 **不要**用「清空 `_retry_after`」的方式在生产代码里绕过退避 ——
 那只是测试里模拟"时间过去了"的手法。
 
+## 记忆只记"真的处理了"的消息（v2.5.1，改动前必读）
+
+**不要**在 `ReplyPipeline.handle()` 的第 2 步（取历史之后、生成之前）就写记忆。
+早期版本写在那里，结果**每次生成失败/超时都会把同一条用户消息再塞一遍**：
+重试 3 次后提示词里就有 4 条「你好」，越重试越长越乱。
+真实日志（LM Studio 19:40~19:42）里能直接看到消息列表从 2 条「你好」涨到 4 条。
+
+现在统一挪到第 6 步：**只有真的产出回复了才记账**。失败/跳过/拦截都不写。
+
+排查工具：
+
+```powershell
+.\.venv\Scripts\python.exe tools\check_memory_hygiene.py        # 找泄露身份/截断半句/重复条目
+.\.venv\Scripts\python.exe tools\clean_memory.py [--apply]      # 清理（自动备份）
+```
+
+**记忆里的旧回复会被当成 few-shot 示例喂回模型** —— 所以修复前那些
+「我不是任何人，只是个代回复助手呢」必须在清理时删掉，
+否则模型会照着学，继续自称助手（实测：模型在 reasoning 里写
+"the model previously violated rules (admitting to be an assistant)"）。
+
 ## 本地模型慢 / 超时的排查（v2.5.0）
 
 ```powershell
 .\.venv\Scripts\python.exe tools\check_local_llm_speed.py    # 各模型实际耗时
 .\.venv\Scripts\python.exe tools\check_local_llm_timeout.py  # 复现程序真实请求
+.\.venv\Scripts\python.exe tools\check_no_think.py            # 关思考能不能救
 ```
 
-实测（RTX 5060 8GB，2026-10-01）：**同时加载 4 个模型**（9B + 3 个小模型）时
-`llama-server` 吃掉 7.1GB，同一提示词 `minicpm-v-4.6` 要 7~12s、
-`gemma-4-e2b` 要 16~30s，直接顶穿 30s 超时。
-**排查本地模型超时，先看 LM Studio 里加载了几个模型** —— 8GB 显卡只该常驻 1~2 个。
+**先看 LM Studio 的生成日志，别急着改超时。** 判读要点：
+
+- `n_gen` 一直涨、`tg = 13~14 t/s`，但 `content` 始终是 `""`、
+  `reasoning_content` 越来越长 → **模型在思考，不是卡死**。
+  此时 `Client disconnected. Stopping generation...` 是**我们自己的 30 秒超时**踢的。
+- 根因是 `max_tokens: 8192` 给思考留了太多空间（实测 30 秒只够 ~400 reasoning token，
+  永远轮不到正文）。
+- **但关不掉思考就别指望调参了**：`qwen/qwen3.5-9b` 在 LM Studio 上
+  `/no_think` 和 `chat_template_kwargs={"enable_thinking": false}` **都无效**
+  （实测 45~90 秒仍无正文）。思考型模型就是先想完才吐字。
+  **判断某个模型能不能关思考，跑 `tools/probe_disable_thinking.py`**，
+  不行就换非思考型模型 —— 对微信自动回复来说思考纯属浪费。
+- 附带因素：同时加载 4 个模型时 `llama-server` 吃 7.1GB（8GB 显卡），
+  但**这不是主因** —— 13.7 t/s 的生成速度其实很健康。
 
 ## 下一步（按顺序）
 

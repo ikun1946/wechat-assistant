@@ -96,7 +96,15 @@ class LLMEngine:
         if level == "off":
             if provider_key in _ENABLE_THINKING_PROVIDERS:
                 body["enable_thinking"] = False
-            if model.startswith("qwen3") or "qwen3" in model:
+            if self._provider.local:
+                # 本地服务（LM Studio / Ollama，走 llama.cpp 的 OpenAI 兼容层）关思考的标准写法。
+                # `/no_think` 是 Qwen3 的老办法，对新版模型常常无效。
+                # ⚠ 但这**不是万能的**：实测 qwen/qwen3.5-9b 在 LM Studio 上
+                # `/no_think` 和 chat_template_kwargs 都关不掉思考 —— 思考型模型
+                # 就是要先想完才吐字。碰到这种情况只能换模型或加大超时，
+                # 详见 tools/probe_disable_thinking.py。
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif model.startswith("qwen3") or "qwen3" in model:
                 # Qwen3 官方推荐：在提示词末尾加 /no_think 关闭思考
                 if "/no_think" not in system_prompt:
                     system_prompt = (system_prompt + " /no_think").strip()

@@ -79,10 +79,13 @@ class ReplyPipeline:
             self._log("denied", chat=msg.chat_name, text=msg.text, reason=decision.reason)
             return PipelineResult("denied", decision.reason)
 
-        # 2. 取历史（须在记录本条消息之前）+ 记录收到消息
+        # 2. 取历史（须在记录本条消息之前）
+        #    ⚠ 记忆**不要**在这里写 —— 早期版本写在这里，结果每次生成失败/超时都会
+        #    把同一条用户消息再塞一遍，重试 3 次后提示词里就有 4 条「你好」，
+        #    越重试越长越乱，模型还会把截断的半句当成错别字（实测踩过）。
+        #    现在统一挪到第 6 步：只有真的产出回复了才记账。
         history_limit = self._skills.memory.max_messages if self._skills.memory.enabled else 0
         history = tuple(self._memory.recent(msg.chat_name, history_limit)) if history_limit else ()
-        self._remember_incoming(msg)
 
         ctx = ReplyContext(
             chat_name=msg.chat_name,
@@ -121,6 +124,8 @@ class ReplyPipeline:
             return PipelineResult("skipped", f"回复被安全技能拦截：{review.reason}")
 
         # 6. 通过：产出「计划」（含拟人化延迟），发送由主循环执行
+        #    走到这里说明这条消息真的被处理了，这时才写进记忆。
+        self._remember_incoming(msg)
         delay = self._gateway.next_delay()
         self._log("planned", chat=msg.chat_name, text=msg.text, reply=reply, delay=round(delay, 2))
         return PipelineResult("replied", "ok", reply, delay)
