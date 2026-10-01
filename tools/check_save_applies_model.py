@@ -46,15 +46,40 @@ def main() -> int:
     import tempfile
 
     tmp = tempfile.TemporaryDirectory()
-    real_path = cfg_mod.DEFAULT_CONFIG_PATH
     cfg_path = Path(tmp.name) / "config.toml"
-    cfg_mod.DEFAULT_CONFIG_PATH = cfg_path
 
-    # 所有弹窗都吞掉，避免脚本卡住
-    QMessageBox.information = staticmethod(lambda *a, **k: None)
-    QMessageBox.warning = staticmethod(lambda *a, **k: None)
-
+    # ⚠⚠ 必须**同时**改两个地方（这里踩过一次，把用户真实配置写坏过）：
+    #   gui.py 是 `from .config import DEFAULT_CONFIG_PATH` —— **模块级绑定**，
+    #   只改 cfg_mod 的话 _on_save 仍然会写真实的 config.toml。
+    #   再加一道保险：把真实文件设成只读，真写到了会立刻抛 PermissionError。
+    real_path = cfg_mod.DEFAULT_CONFIG_PATH
+    real_mode = real_path.stat().st_mode
     try:
+        real_path.chmod(0o444)
+    except OSError:
+        pass
+    try:
+        cfg_mod.DEFAULT_CONFIG_PATH = cfg_path
+        gui.DEFAULT_CONFIG_PATH = cfg_path
+        try:
+            cfg_path.write_text(cfg_mod.dump_config_text(AppConfig()), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover
+            raise SystemExit(f"临时配置写不了：{exc}") from exc
+
+        class _Guard:
+            """任何一次写真实 config.toml 的尝试都立刻炸出来。"""
+
+            def __call__(self, *_a, **_k):
+                raise AssertionError(
+                    "代码试图写真实 config.toml！请检查 gui.DEFAULT_CONFIG_PATH 是否被改到临时文件"
+                )
+
+        cfg_mod.write_config = _Guard()  # type: ignore[attr-defined]
+
+        # 所有弹窗都吞掉，避免脚本卡住
+        QMessageBox.information = staticmethod(lambda *a, **k: None)
+        QMessageBox.warning = staticmethod(lambda *a, **k: None)
+
         cfg = AppConfig()
         cfg.llm.provider = "lmstudio"
         cfg.llm.base_url = "http://127.0.0.1:1234/v1"
@@ -62,10 +87,6 @@ def main() -> int:
         cfg.llm.timeout_sec = 600.0
         cfg.whitelist.chats = ("测试会话",)
         cfg_path.write_text(cfg_mod.dump_config_text(cfg), encoding="utf-8")
-        # ⚠ 必须同时改 gui 里的那份绑定：`gui.py` 是 `from .config import
-        # DEFAULT_CONFIG_PATH`（模块级绑定），只改 cfg_mod 的话 _on_save 仍会
-        # 写到**真实 config.toml** —— 这个坑我自己踩过一次，把用户配置写坏了。
-        gui.DEFAULT_CONFIG_PATH = cfg_path
         gui.load_config = lambda *a, **k: cfg_mod.load_config(cfg_path)
 
         window = gui.MainWindow()
@@ -137,6 +158,12 @@ def main() -> int:
         app.processEvents()
     finally:
         cfg_mod.DEFAULT_CONFIG_PATH = real_path
+        gui.DEFAULT_CONFIG_PATH = real_path
+        # 恢复真实 config.toml 的写权限（它是临时被设成只读做保险的）
+        try:
+            real_path.chmod(real_mode)
+        except OSError:
+            pass
         tmp.cleanup()
 
     print()
