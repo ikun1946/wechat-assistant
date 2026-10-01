@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from wxbot.brain.learned import LearnedItem, LearnedStore
-from wxbot.brain.llm import LLMError
+from wxbot.brain.llm import LLMError, LLMResult
 from wxbot.brain.memory import ChatMemory
 from wxbot.brain.pipeline import PipelineResult, ReplyPipeline
 from wxbot.config import (
@@ -203,6 +203,43 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.handle(IncomingMessage(chat_name="陌生人", text="在吗"))
         self.assertEqual(result.action, "denied")
         self.assertEqual(memory.recent("陌生人", 10), [])
+
+    # ---------- 观测数据：上下文占用 + 思考过程（v2.6.0） ----------
+    def test_pipeline_exposes_context_usage_and_reasoning(self):
+        """「运行」页要显示上下文窗口占用和思考过程，数据必须从流水线透出来。"""
+        cfg = make_config("llm")
+
+        def generator(text, *, system_prompt, history):
+            return LLMResult(
+                text="在的～",
+                reasoning="Thinking Process: 先看人设，再看上下文……",
+                prompt_tokens=1203,
+                completion_tokens=17,
+                context_length=8192,
+                finish_reason="stop",
+            )
+
+        pipeline, _ = self.make_pipeline(cfg, generator=generator)
+        result = pipeline.handle(IncomingMessage(chat_name="张三", text="在吗"))
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(result.prompt_tokens, 1203)
+        self.assertEqual(result.context_length, 8192)
+        self.assertAlmostEqual(result.context_ratio, 1203 / 8192, places=4)
+        self.assertIn("1,203", result.context_display)
+        self.assertIn("15%", result.context_display)
+        self.assertIn("Thinking Process", result.reasoning)
+
+    def test_string_generator_still_works(self):
+        """测试注入的生成器返回纯字符串时不能崩（向后兼容）。"""
+        cfg = make_config("llm")
+        pipeline, _ = self.make_pipeline(
+            cfg, generator=lambda text, *, system_prompt, history: "好的～"
+        )
+        result = pipeline.handle(IncomingMessage(chat_name="张三", text="在吗"))
+        self.assertEqual(result.action, "replied")
+        self.assertEqual(result.reply_text, "好的～")
+        self.assertEqual(result.context_ratio, 0.0)
+        self.assertEqual(result.context_display, "—")
 
     # ---------- 自学习技能 ----------
     def test_learned_prompt_injection(self):

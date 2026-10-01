@@ -60,6 +60,23 @@ n_gen = 385, tg = 13.39 t/s          ← 速度很健康
 .\.venv\Scripts\python.exe tools\check_no_think.py            # 关思考能不能救
 ```
 
+## 运行页：上下文窗口占用 + 模型思考过程
+
+「运行」页指标卡下面有一张**上下文窗口**卡片：
+
+- **占用条**：`prompt_tokens / context_length`，用颜色分级 ——
+  <70% 蓝、≥70% 橙、≥90% 红。上下文快满时模型会开始答非所问甚至直接报错，
+  这时该去「技能」页把「对话记忆」的条数调小。
+- **最近一次思考过程**：点标题展开。思考型模型（qwen3.5 / o 系列）会先想几十秒才吐字，
+  展开就能看到它到底在想什么，而不是干等着以为程序卡死了。
+  实时日志里也会用 `🧠` 打一行思考摘要。
+
+数据链路：模型返回的 `usage.prompt_tokens` → `LLMResult` → `PipelineResult` →
+`RunnerStats` → 界面。Claude 走 `input_tokens`/thinking 块，已一并适配。
+
+自检：`tools/check_context_usage.py`（用真实模型响应验证用量解析）、
+`tools/shot_run_context.py`（截三种状态：空闲 / 正常 / 快满告警）。
+
 ## 记忆体检
 
 对话记忆会把**之前的回复当成 few-shot 示例**喂回给模型，所以脏数据会直接教坏模型。

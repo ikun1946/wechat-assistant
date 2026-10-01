@@ -17,9 +17,47 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from dataclasses import dataclass, field
 
 from ..config import LLMConfig, load_secret_api_key
 from ..providers import get_provider
+
+
+@dataclass
+class LLMResult:
+    """一次生成的结果 + 观测数据。
+
+    `prompt_tokens / context_length` 就是**上下文窗口占用**，
+    图形界面「运行」页要拿它画占用条；`reasoning` 是模型的思考过程
+    （OpenAI 兼容层在 `reasoning_content`，Claude 在 thinking 块里）。
+    """
+
+    text: str = ""
+    reasoning: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    context_length: int = 0
+    finish_reason: str = ""
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def context_ratio(self) -> float:
+        """上下文窗口占用比例（0~1）。拿不到用量时返回 0。"""
+        if self.context_length <= 0 or self.prompt_tokens <= 0:
+            return 0.0
+        return min(1.0, self.prompt_tokens / self.context_length)
+
+    @property
+    def context_display(self) -> str:
+        """给界面用的一行摘要，例如「1,203 / 8,192 · 15%」。"""
+        if self.prompt_tokens <= 0:
+            return "—"
+        if self.context_length <= 0:
+            return f"{self.prompt_tokens:,} tokens"
+        ratio = self.context_ratio
+        return (
+            f"{self.prompt_tokens:,} / {self.context_length:,} · {ratio:.0%}"
+        )
 
 # 思考预算（Claude thinking.budget_tokens）
 _THINKING_BUDGET = {"low": 1_024, "medium": 4_096, "high": 16_384}
@@ -139,13 +177,38 @@ class LLMEngine:
         history: list[tuple[str, str]] | None = None,
     ) -> str:
         """生成一条回复。history 为 [(role, content), ...]，role 取 user/assistant。"""
+        return self.generate_detailed(
+            user_text, system_prompt=system_prompt, history=history
+        ).text
+
+    def generate_detailed(
+        self,
+        user_text: str,
+        *,
+        system_prompt: str | None = None,
+        history: list[tuple[str, str]] | None = None,
+    ) -> LLMResult:
+        """同 generate()，但连同 token 用量与思考过程一起返回。
+
+        图形界面要用两样东西：
+        - **上下文占用**：`usage.prompt_tokens / context_length`；
+        - **思考过程**：`reasoning`（很多模型会把它放在 `reasoning_content`，
+          思考时正文是空的 —— 之前这里直接抛错，看不到它到底在想什么）。
+        """
         system = system_prompt if system_prompt is not None else self._config.system_prompt
+        context_length = max(1, int(getattr(self._config, "context_length", 0) or 0))
         if self._config.api_style == "anthropic":
-            return self._generate_anthropic(user_text, system, history or [])
-        return self._generate_openai(user_text, system, history or [])
+            return self._generate_anthropic(user_text, system, history or [], context_length)
+        return self._generate_openai(user_text, system, history or [], context_length)
 
     # ---------- OpenAI 兼容 ----------
-    def _generate_openai(self, user_text: str, system: str, history: list[tuple[str, str]]) -> str:
+    def _generate_openai(
+        self,
+        user_text: str,
+        system: str,
+        history: list[tuple[str, str]],
+        context_length: int = 0,
+    ) -> LLMResult:
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -174,17 +237,28 @@ class LLMEngine:
         if not isinstance(message, dict):
             raise LLMError("响应格式异常：message 不是对象")
 
+        usage = data.get("usage") if isinstance(data, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        result = LLMResult(
+            reasoning=str(message.get("reasoning_content") or message.get("reasoning") or ""),
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            context_length=context_length,
+            finish_reason=str(data["choices"][0].get("finish_reason", "") or ""),
+        )
+
         content = message.get("content")
         text = content.strip() if isinstance(content, str) else ""
         if text:
-            return text
+            result.text = text
+            return result
 
         # content 为空：思考型模型常见两种原因，给出可直接照做的提示
-        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-        finished = str(data["choices"][0].get("finish_reason", ""))
+        reasoning = result.reasoning
+        finished = result.finish_reason
         if reasoning:
             raise LLMError(
-                f"模型只返回了思考内容、没有正文（思考 {len(str(reasoning))} 字，"
+                f"模型只返回了思考内容、没有正文（思考 {len(reasoning)} 字，"
                 f"finish_reason={finished or '未知'}）。"
                 f"请把「最大输出」调大（建议 ≥1024），或把「思考等级」设为关闭"
             )
@@ -198,7 +272,13 @@ class LLMEngine:
         return max(configured, 1024)
 
     # ---------- Anthropic ----------
-    def _generate_anthropic(self, user_text: str, system: str, history: list[tuple[str, str]]) -> str:
+    def _generate_anthropic(
+        self,
+        user_text: str,
+        system: str,
+        history: list[tuple[str, str]],
+        context_length: int = 0,
+    ) -> LLMResult:
         messages: list[dict[str, str]] = []
         for role, content in history:
             if role in ("user", "assistant"):
@@ -221,12 +301,26 @@ class LLMEngine:
             blocks = data["content"]
         except (KeyError, TypeError) as exc:
             raise LLMError(f"响应格式异常：{exc}") from exc
-        parts = [
-            str(block.get("text", ""))
-            for block in blocks
-            if isinstance(block, dict) and block.get("type") == "text"
-        ]
-        text = "".join(parts).strip()
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text_parts.append(str(block.get("text", "")))
+            elif block.get("type") == "thinking":
+                thinking_parts.append(str(block.get("thinking", "")))
+        text = "".join(text_parts).strip()
         if not text:
             raise LLMError("模型返回了空内容")
-        return text
+
+        usage = data.get("usage") if isinstance(data, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        return LLMResult(
+            text=text,
+            reasoning="\n".join(thinking_parts).strip(),
+            prompt_tokens=int(usage.get("input_tokens") or 0),
+            completion_tokens=int(usage.get("output_tokens") or 0),
+            context_length=context_length,
+            finish_reason=str(data.get("stop_reason", "") or ""),
+        )

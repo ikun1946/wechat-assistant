@@ -41,6 +41,12 @@ def _fingerprint(message: IncomingMessage) -> str:
     return f"{normalize_name(message.chat_name)}|{normalize_name(message.text)}"
 
 
+def _one_line(text: str, limit: int = 120) -> str:
+    """把思考过程压成一行摘要（完整内容走事件数据，不丢）。"""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 @dataclass
 class RunnerStats:
     polls: int = 0
@@ -53,6 +59,25 @@ class RunnerStats:
     started_at: float | None = None
     last_error: str = ""
     last_message: str = ""
+    # 上下文窗口占用（图形界面「运行」页画进度条用）
+    context_used: int = 0
+    context_total: int = 0
+    # 最近一次的思考过程；非空说明这个模型会先想再答
+    last_reasoning: str = ""
+
+    @property
+    def context_ratio(self) -> float:
+        if self.context_total <= 0 or self.context_used <= 0:
+            return 0.0
+        return min(1.0, self.context_used / self.context_total)
+
+    @property
+    def context_display(self) -> str:
+        if self.context_used <= 0:
+            return "—"
+        if self.context_total <= 0:
+            return f"{self.context_used:,} tokens"
+        return f"{self.context_used:,} / {self.context_total:,} · {self.context_ratio:.0%}"
 
 
 @dataclass
@@ -209,6 +234,18 @@ class Runner:
                 chat=message.chat_name,
             )
             result = self._pipeline.handle(message)
+            if result.prompt_tokens:
+                self.stats.context_used = result.prompt_tokens
+                self.stats.context_total = result.context_length
+            if result.reasoning:
+                self.stats.last_reasoning = result.reasoning
+                # 思考过程单独发一个事件，界面里用弱化样式显示，别和正文混为一谈
+                self._emit(
+                    "thinking",
+                    f"模型思考（{len(result.reasoning)} 字）：{_one_line(result.reasoning)}",
+                    chat=message.chat_name,
+                    reasoning=result.reasoning,
+                )
             if result.action == "replied":
                 self._attempts.pop(fingerprint, None)
                 self._retry_after.pop(fingerprint, None)

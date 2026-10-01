@@ -283,6 +283,27 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 **不要**用「清空 `_retry_after`」的方式在生产代码里绕过退避 ——
 那只是测试里模拟"时间过去了"的手法。
 
+## 观测数据：上下文占用与思考过程（v2.6.0）
+
+「运行」页要显示这两样，所以观测数据**必须一路透传到界面**，改动时别在中间截断：
+
+```
+模型响应 usage/reasoning_content
+  → LLMResult (brain/llm.py)        prompt_tokens / completion_tokens / reasoning / context_length
+  → PipelineResult (brain/pipeline.py)  同样四个字段 + context_ratio / context_display
+  → RunnerStats (runner.py)         context_used / context_total / last_reasoning
+  → gui._update_context_display()   占用条 + 「最近一次思考过程」
+```
+
+要点：
+
+- `LLMEngine.generate()` **保持返回 str**（很多调用方和测试依赖它）；
+  带元信息的走 `generate_detailed()` → `LLMResult`。改的时候别把 `generate` 的签名改了。
+- 思考内容在 OpenAI 兼容层叫 `reasoning_content`，Claude 在 `thinking` 块里，两个都要读。
+- Runner 额外发一个 `kind="thinking"` 的事件，日志里用 `🧠` 显示摘要；
+  完整内容在 `event.data["reasoning"]`。
+- `_generate()` 允许注入的测试生成器返回**纯字符串**，要包成 `LLMResult`（向后兼容）。
+
 ## 记忆只记"真的处理了"的消息（v2.5.1，改动前必读）
 
 **不要**在 `ReplyPipeline.handle()` 的第 2 步（取历史之后、生成之前）就写记忆。

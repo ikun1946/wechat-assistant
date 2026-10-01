@@ -28,6 +28,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
+        QProgressBar,
         QPushButton,
         QScrollArea,
         QSlider,
@@ -185,6 +186,29 @@ NAV_ITEMS = (
     ("skills", "✦", "技能", "让 AI 更懂你的说话方式，并守住安全边界"),
     ("logs", "▤", "日志", "本地审计日志，可回溯每一次决策"),
 )
+
+
+def _escape(text: str) -> str:
+    """HTML 转义 —— 模型思考过程要放进 QTextEdit.setHtml。"""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _render_reasoning(text: str) -> str:
+    """把思考过程渲染成可读 HTML。
+
+    模型思考里满是 markdown 粗体（`**Analyze**`），原样显示是一堆星号，
+    这里做个**最小**渲染：只处理 `**粗体**`，其余保持纯文本。
+    """
+    import re as _re
+
+    escaped = _escape(text)
+    escaped = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+    return escaped.replace("\n", "<br>")
 
 
 def _split_by_chars(text: str) -> list[str]:
@@ -629,6 +653,9 @@ class MainWindow(QMainWindow):
             stats_row.addWidget(card)
         layout.addLayout(stats_row)
 
+        # ---- 上下文窗口占用 + 模型思考 ----
+        layout.addWidget(self._build_context_card())
+
         # ---- 参数 + 日志 ----
         bottom = QHBoxLayout()
         bottom.setSpacing(14)
@@ -709,6 +736,109 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(bottom, 1)
         return page
+
+    def _build_context_card(self) -> QWidget:
+        """「上下文窗口占用」+「最近一次思考过程」。
+
+        为什么需要：上下文快满时模型会开始答非所问、或者直接报错，
+        但界面上完全看不出来；思考型模型（qwen3.5 / o 系列）更是先想几十秒才吐字，
+        不显示思考过程就会以为程序卡死了。
+        """
+        colors = get_theme(self._current_theme_name())
+        card = Card()
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(16, 13, 16, 13)
+        outer.setSpacing(10)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title = QLabel("上下文窗口")
+        title.setObjectName("CardTitle")
+        head.addWidget(title)
+        self.ctx_usage_label = QLabel("尚未生成")
+        self.ctx_usage_label.setObjectName("Faint")
+        head.addWidget(self.ctx_usage_label)
+        head.addStretch(1)
+        self.ctx_model_label = QLabel("")
+        self.ctx_model_label.setObjectName("Faint")
+        head.addWidget(self.ctx_model_label)
+        outer.addLayout(head)
+
+        # 占用条
+        self.ctx_bar = QProgressBar()
+        self.ctx_bar.setRange(0, 1000)  # 千分比，避免 0~100 整数不够用
+        self.ctx_bar.setValue(0)
+        self.ctx_bar.setTextVisible(False)
+        self.ctx_bar.setFixedHeight(8)
+        self.ctx_bar.setToolTip(
+            "本次请求的提示词占用了多少上下文窗口。\n"
+            "接近 100% 时模型会答非所问或直接报错 —— 调小「技能→对话记忆」的条数即可。"
+        )
+        outer.addWidget(self.ctx_bar)
+
+        # 思考过程（默认折叠）
+        self.think_toggle = QPushButton("最近一次思考过程  ▾")
+        self.think_toggle.setObjectName("Ghost")
+        self.think_toggle.setCheckable(True)
+        self.think_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.think_toggle.setStyleSheet(
+            f"text-align: left; font-size: 12.5px; font-weight: 600;"
+            f"color: {colors['muted']}; background: transparent; border: none; padding: 2px 0;"
+        )
+        self.think_toggle.toggled.connect(self._on_think_toggle)
+        self.think_view = QTextEdit()  # 富文本：思考内容用弱化色，和正文区分开
+        self.think_view.setReadOnly(True)
+        self.think_view.setFixedHeight(130)
+        self.think_view.setPlaceholderText("这个模型不会输出思考过程（说明它直接给答案）。")
+        self.think_view.setVisible(False)
+        outer.addWidget(self.think_toggle)
+        outer.addWidget(self.think_view)
+
+        self._colors = colors
+        return card
+
+    def _on_think_toggle(self, checked: bool) -> None:
+        self.think_view.setVisible(checked)
+        self.think_toggle.setText(
+            f"最近一次思考过程  {'▴' if checked else '▾'}"
+        )
+
+    def _update_context_display(self, stats) -> None:
+        """把 runner 的上下文占用与思考过程刷到界面上。"""
+        used = int(getattr(stats, "context_used", 0) or 0)
+        total = int(getattr(stats, "context_total", 0) or 0)
+        if used > 0 and total > 0:
+            ratio = min(1.0, used / total)
+            self.ctx_bar.setValue(int(ratio * 1000))
+            self.ctx_usage_label.setText(
+                f"{used:,} / {total:,} tokens · 占用 {ratio:.0%}"
+            )
+            # 越满越红，早点给warning信号
+            colors = self._colors
+            if ratio >= 0.9:
+                color = colors["danger"]
+            elif ratio >= 0.7:
+                color = colors["warn"]
+            else:
+                color = colors["accent"]
+            self.ctx_bar.setStyleSheet(
+                f"QProgressBar {{ background: {colors['surface2']}; border: none;"
+                f" border-radius: 4px; }}"
+                f"QProgressBar::chunk {{ background: {color}; border-radius: 4px; }}"
+            )
+        else:
+            self.ctx_bar.setValue(0)
+            self.ctx_usage_label.setText("尚未生成")
+
+        reasoning = str(getattr(stats, "last_reasoning", "") or "")
+        if reasoning:
+            self.think_view.setHtml(
+                f'<div style="color:{self._colors["faint"]};font-size:12px;'
+                f'line-height:150%;">{_render_reasoning(reasoning)}</div>'
+            )
+            self.think_toggle.setText(f"最近一次思考过程（{len(reasoning)} 字）  ▾")
+        else:
+            self.think_view.setHtml("")
 
     def _tab_reply(self) -> QWidget:
         page = QWidget()
@@ -1973,6 +2103,7 @@ class MainWindow(QMainWindow):
             "stopped": "⏹",
             "message": "📩",
             "reply": "💬",
+            "thinking": "🧠",
             "info": "·",
             "warn": "⚠",
             "error": "❌",
@@ -1981,6 +2112,7 @@ class MainWindow(QMainWindow):
 
         if self._runner is not None:
             stats = self._runner.stats
+            self._update_context_display(stats)
             self.stat_received.set_value(str(stats.received))
             self.stat_replied.set_value(str(stats.replied))
             self.stat_sent.set_value(str(stats.sent))

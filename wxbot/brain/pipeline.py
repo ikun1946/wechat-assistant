@@ -16,7 +16,7 @@ from typing import Callable
 from ..config import AppConfig
 from ..safety.gateway import SafetyGateway
 from ..wechat.base import IncomingMessage
-from .llm import LLMEngine, LLMError
+from .llm import LLMEngine, LLMError, LLMResult
 from .memory import ChatMemory
 from .rules import RuleEngine
 from .skills import ReplyContext, SkillRegistry
@@ -39,6 +39,25 @@ class PipelineResult:
     reason: str = ""
     reply_text: str = ""
     delay_sec: float = 0.0
+    # 观测数据：上下文窗口占用 + 模型思考过程（图形界面「运行」页要用）
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    context_length: int = 0
+    reasoning: str = ""
+
+    @property
+    def context_ratio(self) -> float:
+        if self.context_length <= 0 or self.prompt_tokens <= 0:
+            return 0.0
+        return min(1.0, self.prompt_tokens / self.context_length)
+
+    @property
+    def context_display(self) -> str:
+        if self.prompt_tokens <= 0:
+            return "—"
+        if self.context_length <= 0:
+            return f"{self.prompt_tokens:,} tokens"
+        return f"{self.prompt_tokens:,} / {self.context_length:,} · {self.context_ratio:.0%}"
 
 
 class ReplyPipeline:
@@ -102,14 +121,21 @@ class ReplyPipeline:
 
         # 4. 生成回复
         try:
-            reply = self._generate(ctx)
+            produced = self._generate(ctx)
         except LLMError as exc:
             self._log("error", chat=msg.chat_name, text=msg.text, reason=str(exc))
             return PipelineResult("error", str(exc))
 
+        reply = produced.text
         if not reply:
             self._log("skipped", chat=msg.chat_name, text=msg.text, reason="没有可用的回复")
-            return PipelineResult("skipped", "没有可用的回复")
+            return PipelineResult(
+                "skipped",
+                "没有可用的回复",
+                prompt_tokens=produced.prompt_tokens,
+                context_length=produced.context_length,
+                reasoning=produced.reasoning,
+            )
 
         # 5. 回复审查（安全技能）
         review = self._skills.check_reply(ctx, reply)
@@ -127,12 +153,30 @@ class ReplyPipeline:
         #    走到这里说明这条消息真的被处理了，这时才写进记忆。
         self._remember_incoming(msg)
         delay = self._gateway.next_delay()
-        self._log("planned", chat=msg.chat_name, text=msg.text, reply=reply, delay=round(delay, 2))
-        return PipelineResult("replied", "ok", reply, delay)
+        self._log(
+            "planned",
+            chat=msg.chat_name,
+            text=msg.text,
+            reply=reply,
+            delay=round(delay, 2),
+            prompt_tokens=produced.prompt_tokens,
+            completion_tokens=produced.completion_tokens,
+        )
+        return PipelineResult(
+            "replied",
+            "ok",
+            reply,
+            delay,
+            prompt_tokens=produced.prompt_tokens,
+            completion_tokens=produced.completion_tokens,
+            context_length=produced.context_length,
+            reasoning=produced.reasoning,
+        )
 
-    def _generate(self, ctx: ReplyContext) -> str | None:
+    def _generate(self, ctx: ReplyContext) -> LLMResult:
+        """返回回复正文 + 观测数据（token 用量、思考过程）。"""
         if self._config.reply.engine == "rules":
-            return self._rules.generate(ctx.incoming_text)
+            return LLMResult(text=self._rules.generate(ctx.incoming_text) or "")
 
         base = self._config.llm.system_prompt.strip() or DEFAULT_BASE_PROMPT
         system_prompt = self._skills.build_system_prompt(ctx, base)
@@ -140,10 +184,14 @@ class ReplyPipeline:
             ("user" if role == "them" else "assistant", text) for role, text in ctx.history
         ]
         if self._generator is not None:
-            return self._generator(
+            produced = self._generator(
                 ctx.incoming_text, system_prompt=system_prompt, history=history
             )
-        return LLMEngine(self._config.llm).generate(
+            # 测试注入的生成器通常只返回字符串
+            if isinstance(produced, LLMResult):
+                return produced
+            return LLMResult(text=str(produced or ""))
+        return LLMEngine(self._config.llm).generate_detailed(
             ctx.incoming_text, system_prompt=system_prompt, history=history
         )
 

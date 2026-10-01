@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from wxbot.brain.llm import LLMResult
 from wxbot.brain.memory import ChatMemory
 from wxbot.brain.pipeline import PipelineResult, ReplyPipeline
 from wxbot.config import (
@@ -260,6 +261,35 @@ class RunnerTests(unittest.TestCase):
             "不应重复上报同一条消息",
         )
 
+    def test_stats_track_context_usage_and_reasoning(self):
+        """「运行」页要显示上下文窗口占用 + 思考过程，Runner 必须攒到 stats 里。"""
+        events: list[RunnerEvent] = []
+        client = FakeClient([[IncomingMessage("张三", "在吗")]])
+        pipeline = MetaPipeline(
+            LLMResult(
+                text="在的～",
+                reasoning="Thinking Process: 先看人设，再看上下文……",
+                prompt_tokens=900,
+                completion_tokens=8,
+                context_length=4096,
+            )
+        )
+        runner = self.make_runner(make_config("dry_run"), client, events, pipeline)
+
+        runner.poll_once()
+
+        stats = runner.stats
+        self.assertEqual(stats.context_used, 900)
+        self.assertEqual(stats.context_total, 4096)
+        self.assertAlmostEqual(stats.context_ratio, 900 / 4096, places=4)
+        self.assertIn("900", stats.context_display)
+        self.assertIn("22%", stats.context_display)
+        self.assertIn("Thinking Process", stats.last_reasoning)
+        self.assertTrue(
+            any(e.kind == "thinking" for e in events),
+            "思考过程要单独发事件，界面才能弱化显示",
+        )
+
     def test_journal_written(self):
         journal_path = self.tmp / "runner.jsonl"
         cfg = make_config()
@@ -275,6 +305,28 @@ class RunnerTests(unittest.TestCase):
         content = journal_path.read_text(encoding="utf-8")
         self.assertIn("runner_start", content)
         self.assertIn("runner_stop", content)
+
+
+class MetaPipeline:
+    """固定返回一条「带观测数据」的 PipelineResult。"""
+
+    def __init__(self, generated):
+        self.generated = generated
+
+    def handle(self, message):
+        return PipelineResult(
+            "replied",
+            "ok",
+            self.generated.text,
+            0.0,
+            prompt_tokens=self.generated.prompt_tokens,
+            completion_tokens=self.generated.completion_tokens,
+            context_length=self.generated.context_length,
+            reasoning=self.generated.reasoning,
+        )
+
+    def note_sent(self, message, result):
+        pass
 
 
 class FailingPipeline:
