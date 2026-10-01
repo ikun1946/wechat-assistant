@@ -203,6 +203,41 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 进程在跑、窗口标题也存在，但 `IsWindowVisible=False`，人眼完全看不到。
 后台启动 GUI **不要加这个参数**。
 
+## 改了配置为什么还在用旧模型（v2.6.4 修）
+
+**Runner 存的是 cfg 引用，不是拷贝**（`self._config = config`）。
+所以问题不在 Runner 缓存了旧值，而在 **GUI 的 `_on_save` 写完磁盘就完事**——
+它构造了一个全新的 `AppConfig`（`_collect_config()` 的返回值）写进文件，
+**却从没把这个新对象告诉正在运行的 Runner**。Runner 手里还是启动时那个旧对象。
+
+早先的提示是"配置已保存；正在运行的循环仍用旧配置，重新启动开关后生效"——
+诚实，但没人会记得。于是用户换了模型、点了保存，看到的仍是旧模型在跑。
+
+现在 `_on_save` 检测到 Runner 在跑就 **stop + 用新 cfg 重建 + start**，
+换模型不用重启程序。要点：
+
+- 重建要用 `_collect_config()` 拿到的**新对象**，不能复用旧 cfg（那就等于什么都没做）。
+- 重建失败要 `run_switch.setChecked(False)`，否则界面显示"运行中"而实际没跑。
+- `Runner.start()` 会重置 `RunnerStats`，计数器归零 —— 这是可接受的（配置本来就变了）。
+- 同样地，**「测试生成」「立即试一次」等用 `_collect_config()` 的路径本来就是对的**，
+  只有 `_on_save` 漏了。别把"配置什么时候生效"搞混：
+  凡是**当场**用 `_collect_config()` 的操作（试生成、试一次、启动）都立刻生效；
+  **只有保存到磁盘又不重建 Runner** 的路径会滞后。
+
+回归测试 `tests/test_runner.py::SaveRestartsRunnerTests`。
+
+## 滚轮过滤器装在哪些控件上（v2.6.3）
+
+`install_wheel_guard` 除了 guarded 类型（下拉框 / 数字框 / 滑块 / 文本框），
+**还给每个 `QScrollArea` 里的 page widget 装上**。
+
+因为页面上大部分区域是**空白**（卡片之间、标签之间），那里没有 guarded 控件，
+wheel 事件没人接管 —— 而 Qt 默认的 `QScrollArea` 滚轮路径在 PySide6 下不可靠
+（实测：全新的 `QScrollArea` + 干净的 wheel 事件送 viewport，**不滚**）。
+装了之后安装数从 31 涨到 37（6 个页面 widget）。
+
+排查工具 `tools/debug_page_wheel.py`（跑遍 6 页看各控件的滚轮路径）。
+
 ## 降低"机器特征"的既有措施（改动前请确认不要破坏）
 
 - 回复随机延迟（config `safety.min_reply_delay_sec` / `max_reply_delay_sec`，默认 2~6s）

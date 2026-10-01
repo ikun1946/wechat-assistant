@@ -491,25 +491,35 @@ class SaveRestartsRunnerTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_runner_locks_model_at_construction(self):
-        """Runner 实例化时锁定了 model —— 这是被 bug 依赖的"坏"行为。
-        _on_save 的修复就是绕过它：构造新 Runner。
+    def test_runner_holds_reference_not_copy(self):
+        """Runner 存的是 cfg 引用，不是拷贝。
+
+        —— 这反过来说明了 bug 的真原因：不是 Runner 缓存了旧 cfg；
+        而是 GUI 的 _on_save 写完磁盘就完事，**从未把新 cfg 对象告诉 Runner**。
+        所以修复必须是「构造新 Runner 并替换」，光 mutate cfg 不够。
         """
         cfg = AppConfig()
         cfg.llm.model = "snapshot-model"
         runner = r_mod.build_default_runner(cfg, client=VisionClient())
         self.assertEqual(runner._config.llm.model, "snapshot-model")
-        # 改 cfg 不影响已构造的 Runner（这正是 bug 的根因）
-        cfg.llm.model = "completely-different"
-        self.assertEqual(runner._config.llm.model, "snapshot-model")
+        # mutate cfg 会让 Runner 看到（引用语义）—— 关键：build 时传新 cfg 才会真换
+        cfg.llm.model = "different"
+        self.assertEqual(runner._config.llm.model, "different")
 
-    def test_rebuilding_runner_picks_up_new_model(self):
-        """模拟 _on_save 末尾的\"停 + 用新 cfg 重建 + 起\"过程。"""
+    def test_rebuilding_runner_picks_up_new_config(self):
+        """模拟 _on_save 末尾的「停 + 用新 cfg 重建 + 起」过程。
+
+        如果只 mutate 同一份 cfg，重建 Runner 是冗余的；
+        但 _on_save 是从一个**全新的** AppConfig（_collect_config 返回的）
+        重建 Runner 是必要的。
+        """
         original_path = cfg_mod.DEFAULT_CONFIG_PATH
         cfg_mod.DEFAULT_CONFIG_PATH = self._cfg_path
         try:
-            from wxbot.config import write_default_config
-            write_default_config(self._cfg_path)
+            from wxbot.config import AppConfig as _AppCfg, dump_config_text
+            cfg_mod.DEFAULT_CONFIG_PATH.write_text(
+                dump_config_text(_AppCfg()), encoding="utf-8"
+            )
             cfg = cfg_mod.load_config(self._cfg_path)
             cfg.llm.model = "old-model"
             old_runner = r_mod.build_default_runner(cfg, client=VisionClient())
