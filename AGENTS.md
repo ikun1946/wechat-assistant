@@ -203,6 +203,39 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 进程在跑、窗口标题也存在，但 `IsWindowVisible=False`，人眼完全看不到。
 后台启动 GUI **不要加这个参数**。
 
+## 配置热更新：别 stop/start（v2.6.5）
+
+**换配置时不要「停掉 Runner 再建一个」** —— 每建一个新 Runner 都会走到 WGC 抓屏，
+而 Windows 图形捕获在「同一窗口反复建/销抓屏会话」这个模式上**原生就会崩**。
+
+faulthandler 实测的崩溃栈（0xC0000005）：
+
+```
+Current thread:  windows_capture/__init__.py:241 in start   ← 崩的是抓屏线程自己
+Thread (runner): capture.py done.wait()                      ← 正等着这一次抓屏
+Thread (main):    runner.py:154 in stop → Thread.join()
+```
+
+**第 2 轮启动必崩**，也就是说连用户手动「关总开关再开」都会闪退 —— ��是既有隐患。
+
+正确做法：`Runner.apply_config(cfg)` **就地**替换配置对象。
+`_loop` 每轮都读 `self._config`，所以下一轮 poll 就用新模型，既不停线程也不碰 WGC。
+
+`apply_config` 必须**一路换到底**，换一半等于没换（模型名变了、实际生成还是旧的）：
+
+| 持有者 | 字段 |
+| --- | --- |
+| Runner | `_config` |
+| ReplyPipeline | `_config` |
+| SkillRegistry | `_skills`（按 `config.skills` 重建） |
+| SafetyGateway | `_safety` / `_whitelist` / `_quiet_spans` |
+
+另外 `grab_frame` 也加了保活 + 全局串行 + 硬闸（见 `wechat/capture.py`），
+但那是兜底，**真正的修复是不再反复重建 Runner**。
+
+回归：`tests/test_runner.py::SaveRestartsRunnerTests`、
+端到端 `tools/check_save_applies_model.py`（真实 MainWindow 上换两次模型）。
+
 ## 改了配置为什么还在用旧模型（v2.6.4 修）
 
 **Runner 存的是 cfg 引用，不是拷贝**（`self._config = config`）。

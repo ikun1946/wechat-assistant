@@ -492,6 +492,13 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self._page_index: dict[str, int] = {}
+        # VisionClient **只建一次**、反复复用（v2.6.5）。
+        # 为什么：Runner 线程正卡在 `grab_bgr` 的 WGC 原生帧里时，如果 VisionClient
+        # 被 GC 回收，原生句柄随之释放 → 硬崩 0xC0000005（实测：第 2 轮启停必崩）。
+        # 复用还顺带带来两个好处：OCR 引擎只加载一次（启动更快），
+        # 以及 `_last_replied_text` / `_claimed_text` 这些去重状态**跨重启保留** ——
+        # 否则改一次配置就会清空记忆，有重复回复的风险。
+        self._vision_client = None
         builders = {
             "run": self._tab_run,
             "reply": self._tab_reply,
@@ -1707,6 +1714,23 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _get_vision_client(self):
+        """拿到复用的 VisionClient（懒建一次，之后一直用同一个）。"""
+        if self._vision_client is None:
+            from .wechat.vision_client import VisionClient
+
+            self._vision_client = VisionClient()
+        return self._vision_client
+
+    def _build_runner(self, cfg, *, poll_interval: float):
+        """按给定配置建 Runner，但**复用同一个 VisionClient**。"""
+        return build_default_runner(
+            cfg,
+            client=self._get_vision_client(),
+            on_event=self._bridge.handle,
+            poll_interval=poll_interval,
+        )
+
     # ------------------------------------------------------------- 动作
     def _on_save(self) -> None:
         try:
@@ -1724,26 +1748,20 @@ class MainWindow(QMainWindow):
             save_secret_api_key(api_key)
             self.api_key_edit.clear()
             message += "\n\nAPI Key 已保存到本地 secrets.toml（不会提交到版本库）"
-        # 如果 Runner 在跑，配置变了它不会自动重新读模型/超时等 ——
-        # 之前是让用户手动关开关再开（很容易忘掉，体验很差）。
-        # 现在自动 stop + 用最新配置 start，保证换模型不重启程序就生效。
-        restarted = False
+        # 如果循环在跑，**就地**把新配置换进去 —— 不重启循环。
+        # 不能用「stop + 重建 Runner」：每次重启都会新建 Runner，而 WGC 抓屏在
+        # 「同一窗口反复建/销抓屏会话」这个模式上原生就会崩（0xC0000005），
+        # 连用户手动关开关再开都会闪退。`apply_config` 只换配置对象，下一轮 poll
+        # 就用新模型，既不碰 WGC，也不丢去重状态。
+        applied = False
         if self._runner is not None and self._runner.running:
             try:
-                self._runner.stop(timeout=4.0)
-                self._runner = build_default_runner(
-                    cfg,
-                    on_event=self._bridge.handle,
-                    poll_interval=max(1.0, self.poll_interval_spin.value()),
-                )
-                self._runner.start()
-                restarted = True
+                self._runner.apply_config(cfg)
+                applied = True
             except Exception as exc:  # noqa: BLE001
-                self._runner = None
-                self.run_switch.setChecked(False)
-                QMessageBox.warning(self, "重启循环失败", str(exc))
-        if restarted:
-            message += "\n\n识别和循环已用新配置重启（无需重启程序）"
+                self._append_run_log(f"⚠ 新配置没能热更新，将在你下次启动时生效：{exc}")
+        if applied:
+            message += "\n\n识别和循环已热更新为新配置（无需重启，也不会打断正在识别的会话）"
         else:
             message += "\n\n提示：自动对话总开关关着，新配置下次打开时生效。"
         QMessageBox.information(self, "已保存", message)
@@ -2128,10 +2146,8 @@ class MainWindow(QMainWindow):
             warnings.append("当前是全自动模式")
 
         try:
-            self._runner = build_default_runner(
-                cfg,
-                on_event=self._bridge.handle,
-                poll_interval=max(1.0, self.poll_interval_spin.value()),
+            self._runner = self._build_runner(
+                cfg, poll_interval=max(1.0, self.poll_interval_spin.value())
             )
         except Exception as exc:  # noqa: BLE001
             self._runner = None

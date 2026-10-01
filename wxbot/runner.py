@@ -17,7 +17,7 @@ from typing import Callable
 from .brain.pipeline import ReplyPipeline
 from .config import AppConfig
 from .journal import Journal
-from .safety.gateway import SafetyGateway
+from .safety.gateway import SafetyGateway, parse_quiet_span
 from .wechat.base import IncomingMessage, WeChatClient
 
 STATE_STOPPED = "stopped"
@@ -145,6 +145,38 @@ class Runner:
         self._log("runner_start", mode=self._config.mode, interval=self._poll_interval)
         self._emit("started", f"已启动（模式：{self._config.mode}，轮询间隔 {self._poll_interval:g}s）")
         return True
+
+    def apply_config(self, config) -> None:
+        """把新配置**就地**换进运行中的循环，不重启线程。
+
+        为什么不用「stop + 重新 build 一个 Runner」（v2.6.4 的做法）：
+        每次重建都会新建 Runner，而 WGC 抓屏在「同一窗口反复建/销会话」这个模式上
+        **原生就会崩**（faulthandler 实测：崩在 `windows_capture/__init__.py:241`
+        的 `capture.start()` 里，0xC0000005）。所以第二轮启动必崩 —— 也就是说
+        连用户手动「关开关再开」都会闪退。
+
+        这里改成原地替换：`_loop` 每轮都读 `self._config`，
+        下一轮 poll 就用新模型，不需要停线程，也就不碰 WGC 会话。
+
+        注意要一路换到底，否则换了 runner 没用（pipeline/gateway/skills 各自持有一份）：
+        runner._config → pipeline._config → pipeline._skills（人设/记忆等）
+        → gateway._safety / gateway._whitelist
+        """
+        self._config = config
+        pipeline = self._pipeline
+        pipeline._config = config
+        # 技能按 cfg.skills 重建（人设、安全、群聊、学习开关都在这里）
+        if hasattr(pipeline, "_skills") and getattr(pipeline, "_config", None) is config:
+            from .brain.skills import SkillRegistry
+
+            pipeline._skills = SkillRegistry(
+                config.skills, learned_store=getattr(pipeline, "_learned", None)
+            )
+        # 网关里也各存了一份 safety / whitelist
+        gateway = self._gateway
+        gateway._safety = config.safety
+        gateway._whitelist = config.whitelist
+        gateway._quiet_spans = [parse_quiet_span(s) for s in config.safety.quiet_hours]
 
     def stop(self, timeout: float = 6.0) -> bool:
         if self._thread is None:

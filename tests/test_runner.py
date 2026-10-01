@@ -1,4 +1,4 @@
-﻿"""运行控制器（Runner）单元测试：开关语义、统计、安全网关串联。"""
+"""运行控制器（Runner）单元测试：开关语义、统计、安全网关串联。"""
 
 from __future__ import annotations
 
@@ -531,6 +531,51 @@ class SaveRestartsRunnerTests(unittest.TestCase):
             self.assertIsNot(new_runner, old_runner)
         finally:
             cfg_mod.DEFAULT_CONFIG_PATH = original_path
+
+
+    def test_apply_config_swaps_every_holder(self):
+        """v2.6.5：`apply_config` 必须一路换到底。
+
+        只换 runner._config 是不够的 —— pipeline / gateway / skills 各自还攥着
+        一份旧 cfg，换一半等于没换（模型名看着变了，实际生成还是旧模型）。
+        """
+        cfg = AppConfig()
+        cfg.llm.model = "old-model"
+        cfg.llm.timeout_sec = 600.0
+        cfg.whitelist.chats = ("老会话",)
+        runner = r_mod.build_default_runner(cfg, client=FakeClient([]))
+
+        new = AppConfig()
+        new.llm.model = "new-model"
+        new.llm.timeout_sec = 30.0
+        new.whitelist.chats = ("新会话",)
+
+        runner.apply_config(new)
+
+        self.assertEqual(runner._config.llm.model, "new-model")
+        self.assertEqual(runner._pipeline._config.llm.model, "new-model",
+                         "pipeline 也必须换到新配置")
+        self.assertEqual(runner._pipeline._config.llm.timeout_sec, 30.0)
+        self.assertEqual(runner._gateway._whitelist.chats, ("新会话",),
+                         "网关的白名单也要跟着换")
+        self.assertEqual(runner._gateway._safety, new.safety)
+
+    def test_apply_config_does_not_restart_thread(self):
+        """热更新**不能**停线程 —— 停/起会触发 WGC 原生崩溃（0xC0000005）。"""
+        cfg = AppConfig()
+        cfg.whitelist.chats = ("老会话",)
+        runner = r_mod.build_default_runner(cfg, client=FakeClient([]))
+        runner.start()
+        try:
+            thread_before = runner._thread
+            new = AppConfig()
+            new.llm.model = "new-model"
+            runner.apply_config(new)
+            self.assertIs(runner._thread, thread_before, "线程对象应保持不变")
+            self.assertTrue(runner.running, "循环应一直在跑")
+            self.assertEqual(runner._config.llm.model, "new-model")
+        finally:
+            runner.stop()
 
 
 if __name__ == "__main__":

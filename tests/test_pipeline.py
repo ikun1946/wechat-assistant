@@ -1,4 +1,4 @@
-﻿"""回复流水线单元测试。"""
+"""回复流水线单元测试。"""
 
 from __future__ import annotations
 

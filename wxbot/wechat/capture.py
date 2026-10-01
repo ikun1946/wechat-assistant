@@ -34,6 +34,34 @@ SW_RESTORE = 9
 
 MAIN_TITLES = {"微信", "Weixin", "WeChat"}
 
+# WGC 抓屏线程的"保活名单"。
+# ⚠ 这是一个实测踩过的原生崩溃（v2.6.5 修）：
+#   `grab_frame` 里 `thread.join(timeout=0.5)` 超时就直接返回，局部的 `capture`
+#   随即被 GC 回收 → **原生 WGC 句柄被释放**，而后台线程还在用它 →
+#   0xC0000005 硬崩（症状：循环启停第 2 轮必崩，程序直接闪退）。
+#   停不下来的会话就丢进这里保活 —— 宁可泄漏一次，也绝不能让原生对象被提前释放。
+_KEEPALIVE: list[tuple[object, threading.Thread]] = []
+
+# WGC 会话**全局串行**。faulthandler 抓到的崩溃栈证明：崩的是**抓屏线程自己**，
+# 卡在 `windows_capture/__init__.py:241` 的原生 `capture.start()` 里 ——
+# Windows 的图形捕获不允许同一窗口有两个活跃会话，第二个会话一开就访问冲突。
+#
+# 所以：同一时刻只允许一个会话；上一个没死透就**放弃这一帧**（返回 None）。
+# 上层 `poll_new_messages` 见到 None 会安静地跳过这一轮 —— 少抓一帧，
+# 远比崩掉整个程序好。
+_CAPTURE_LOCK = threading.Lock()
+
+# 还在跑的 WGC 会话线程。faulthandler 实测：崩的是**抓屏线程自己**，卡在
+# `windows_capture/__init__.py:241` 的原生 `capture.start()` 里。
+# 只要还有一个旧会话没退出就对同一窗口再开一个，就会撞车 —— Windows 图形捕获
+# 不支持这种交叠。所以这里做硬闸：**有存活会话就不开新的**，宁可这一帧返回 None。
+_LIVE_CAPTURE_THREADS: list[threading.Thread] = []
+
+
+def _live_capture_count() -> int:
+    _LIVE_CAPTURE_THREADS[:] = [t for t in _LIVE_CAPTURE_THREADS if t.is_alive()]
+    return len(_LIVE_CAPTURE_THREADS)
+
 
 def find_wechat_windows() -> list[dict]:
     """复用 window_check 的枚举逻辑。"""
@@ -89,12 +117,34 @@ def grab_frame(
 
     这里保留 frames/settle 参数只是为了让调用方能表达"最多等到几帧"，
     默认 1 帧即可；timeout 是"完全没有帧"时的兜底。
+
+    ⚠ v2.6.5：整个会话在 `_CAPTURE_LOCK` 里**串行**执行。Windows 图形捕获不允许
+    同一窗口有两个活跃会话，并发/交叠开会直接在原生 `capture.start()` 里访问冲突
+    （0xC0000005，faulthandler 实测）。拿不到锁就返回 None，由上层跳过这一轮。
     """
     try:
         from windows_capture import WindowsCapture
     except ImportError:
         return None
 
+    # 拿不到锁 = 上一帧的会话还没收干净，**不要**再开一个（会原生崩溃）
+    if not _CAPTURE_LOCK.acquire(timeout=0.05):
+        return None
+    try:
+        # 硬闸：还有存活的 WGC 会话就不开新的（交叠开会原生崩溃）
+        if _live_capture_count() > 0:
+            return None
+        return _grab_frame_locked(
+            WindowsCapture, hwnd, timeout=timeout, frames=frames, settle=settle
+        )
+    finally:
+        _CAPTURE_LOCK.release()
+
+
+def _grab_frame_locked(
+    WindowsCapture, hwnd: int, *, timeout: float, frames: int, settle: float
+):
+    """真正的抓屏实现。调用方必须已持有 `_CAPTURE_LOCK`。"""
     wanted = max(1, int(frames))
     holder: dict = {}
     seen = 0
@@ -145,10 +195,26 @@ def grab_frame(
             holder["error"] = repr(exc)
             done.set()
 
-    thread = threading.Thread(target=_run, daemon=True)
+    thread = threading.Thread(target=_run, daemon=True, name="wgc-capture")
+    _LIVE_CAPTURE_THREADS.append(thread)  # 硬闸要看到它
     thread.start()
     done.wait(timeout=timeout)
-    thread.join(timeout=0.5)
+
+    # ⚠ 关键：必须**先停掉原生抓屏、再等线程真正结束**，才让 capture 离开作用域。
+    # 只 join 一小段时间是不够的 —— 超时路径下后台线程还活着，
+    # Python 一回收 capture，原生 WGC 句柄就没了，线程里再碰一下就硬崩。
+    control = getattr(capture, "capture", None)
+    if control is not None:
+        try:
+            control.stop()
+        except Exception:  # noqa: BLE001 - 停止失败也不能让它被提前回收
+            pass
+    thread.join(timeout=2.0)
+    if thread.is_alive():
+        # 实在停不下来：保活，绝不能让 GC 在线程还在用的时候回收它
+        _KEEPALIVE.append((capture, thread))
+        if len(_KEEPALIVE) > 8:  # 只留最近的，旧的已结束的可以丢
+            _KEEPALIVE[:] = [item for item in _KEEPALIVE if item[1].is_alive()][-8:]
     return holder.get("image")
 
 
