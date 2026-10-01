@@ -35,6 +35,16 @@ SKIP_NAME_KEYWORDS = ("搜索", "通讯录", "收藏", "朋友圈", "小程序",
 # 设成 60 秒会挡住用户连发的第二条消息（实测踩过）。
 REPORT_COOLDOWN = 5.0
 
+# 换行气泡合并：相邻两行的垂直间隙 <= 0.6 倍行高 → 视为同一个气泡。
+# 按真实抓屏标定（2026-10-01，chat_width=568）：同气泡内 0.17~0.36x，
+# 不同气泡之间最小 0.71x —— 0.6 落在两者之间，两侧都留了余量。
+WRAPPED_LINE_GAP_RATIO = 0.6
+# 对方气泡的左边缘（头像右侧）相对聊天区宽度的位置，实测 138/568 ≈ 0.24
+THEM_LEFT_RATIO = 0.27
+# 对方气泡的右边缘上限：微信气泡最大宽度约 70%，起点 0.24 → 右缘不超过 ~0.70。
+# 留 0.78 作分界，超过就说明这组不是对方的普通气泡 → 宁可判 unknown 也不误回。
+THEM_RIGHT_MAX_RATIO = 0.78
+
 
 @dataclass
 class SessionRow:
@@ -56,6 +66,58 @@ class ChatBubble:
     center_x: float = 0.0
     y: float = 0.0
     score: float = 0.0
+
+
+@dataclass
+class _OcrLine:
+    """聊天区里 OCR 出来的一行文字及其位置（还没合并成气泡）。"""
+
+    text: str
+    left: float
+    right: float
+    top: float
+    bottom: float
+    score: float = 0.0
+
+    @property
+    def center_x(self) -> float:
+        return (self.left + self.right) / 2
+
+    @property
+    def center_y(self) -> float:
+        return (self.top + self.bottom) / 2
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 1.0)
+
+
+def _group_wrapped_lines(lines: list[_OcrLine]) -> list[list[_OcrLine]]:
+    """把**换行的同一个气泡**的若干 OCR 行合并成一组。
+
+    为什么必须先合并：气泡换行时，续行是在气泡内部**左对齐**的，
+    所以一条右对齐的绿色气泡，第二行的中心会掉到中线左边。
+    只看单行中心就会把"我刚发的话"判成"对方发的"，
+    于是 `_latest_definite_bubble` 认为最后一条来自对方 → **重复回复**（实测踩过）。
+
+    合并阈值 0.6 倍行高是按真实抓屏标定的：同一个气泡内相邻行间距实测
+    0.17~0.36 倍行高，而**不同**气泡之间最小也有 0.71 倍（实测 2026-10-01）。
+    纯时间戳（18:25）不参与合并，它自己独立成组。
+    """
+    groups: list[list[_OcrLine]] = []
+    for line in lines:
+        if groups:
+            previous = groups[-1][-1]
+            gap = line.top - previous.bottom
+            if (
+                not _is_timestamp_text(line.text)
+                and not _is_timestamp_text(previous.text)
+                and gap <= max(previous.height, line.height) * WRAPPED_LINE_GAP_RATIO
+            ):
+                groups[-1].append(line)
+                continue
+        groups.append([line])
+    return groups
 
 
 def _looks_like_group(name: str) -> bool:
@@ -824,27 +886,72 @@ class VisionClient(WeChatClient):
         if not result:
             return []
 
-        items = []
+        lines: list[_OcrLine] = []
+        # 聊天区左边缘的"碎片行"过滤：裁剪起点是按 SESSION_LIST_WIDTH_RATIO 估的，
+        # 实际分隔线会差几个像素，于是会话列表最右边的一小条会被裁进来。
+        # 这种又窄又贴左边的行不是聊天内容（真气泡都从头像右侧起头），
+        # 留着会被当成一条"对方发的消息"而触发回复。
+        sliver_left = chat_width * 0.08
+        sliver_right = chat_width * 0.20
         for box, text, score in result:
             content = str(text).strip()
             if not content:
                 continue
             xs = [point[0] for point in box]
             ys = [point[1] for point in box]
-            center_x = sum(xs) / len(xs)
-            if center_x < middle:
-                sender = "them"
-            elif center_x > own_threshold:
-                sender = "me"
+            left, right = min(xs), max(xs)
+            if left < sliver_left and right < sliver_right:
+                continue
+            lines.append(
+                _OcrLine(
+                    text=content,
+                    left=left,
+                    right=right,
+                    top=min(ys),
+                    bottom=max(ys),
+                    score=float(score),
+                )
+            )
+        lines.sort(key=lambda line: (line.top, line.left))
+
+        items: list[ChatBubble] = []
+        for group in _group_wrapped_lines(lines):
+            if len(group) == 1:
+                # 单行气泡：用中心判定（这是原来一直有效的规则，保持不变）
+                line = group[0]
+                if line.center_x < middle:
+                    sender = "them"
+                elif line.center_x > own_threshold:
+                    sender = "me"
+                else:
+                    sender = "unknown"
+                text = line.text
+                center_x = line.center_x
+                y = line.center_y
             else:
-                sender = "unknown"
+                # 换行气泡：续行在气泡内左对齐，**单行中心不可信**。
+                # 改用整块的外接矩形，而且判"我发的"要求**两个条件同时满足**：
+                # 右缘越过自己的阈值，且左缘不在对方的起始位置 ——
+                # 否则一条很宽的对方长消息会被误当成自己发的（那会漏回）。
+                # 判不准就落 unknown：宁可漏回，也绝不乱回。
+                left = min(line.left for line in group)
+                right = max(line.right for line in group)
+                if right > own_threshold and left >= chat_width * THEM_LEFT_RATIO:
+                    sender = "me"
+                elif left < middle and right < chat_width * THEM_RIGHT_MAX_RATIO:
+                    sender = "them"
+                else:
+                    sender = "unknown"
+                text = "".join(line.text for line in group)
+                center_x = (left + right) / 2
+                y = (group[0].top + group[-1].bottom) / 2
             items.append(
                 ChatBubble(
-                    text=content,
+                    text=text,
                     sender=sender,
                     center_x=center_x,
-                    y=sum(ys) / len(ys),
-                    score=float(score),
+                    y=y,
+                    score=min(line.score for line in group),
                 )
             )
         items.sort(key=lambda bubble: bubble.y)
