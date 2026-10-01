@@ -1,0 +1,21 @@
+# 本地私密/生成物，不入库
+.venv/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 编辑器 / 打包产物
+.vscode/
+.idea/
+build/
+dist/
+out/
+*.spec
+
+# 本地配置与私密数据（可能包含个人白名单、API Key、聊天记忆）
+config.toml
+config.toml.*
+secrets.toml
+data/
+*.bak

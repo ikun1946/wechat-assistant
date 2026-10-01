@@ -1,0 +1,244 @@
+# wxbot 项目内约定（给 AI 协作者的备忘）
+
+## 项目目标
+
+Windows 桌面端「个人微信自动回复」小工具。用户已确认：**全自动模式**（程序直接收发），
+以安全为最高优先级（"尽量不封号"）；要求支持**本地模型**、**GUI 设置界面**、**技能系统**。
+
+## 硬性约束（不可违反）
+
+1. 只允许「不侵入微信进程」的技术：WGC 抓屏 / OCR / 键鼠模拟 / UIA 只读。
+   **禁止**：Hook 注入、内存读写、协议逆向、改包（封号高危）。
+2. 所有真实发送必须先通过 `wxbot.safety.gateway.SafetyGateway.check()`，
+   并经过 `ReplyPipeline` 的技能审查；不允许任何绕过路径。
+3. 默认 `dry_run`；切 `auto` 前先空跑验证。白名单为空 = 不回复任何人。
+4. API Key 来源：环境变量（llm.api_key_env）→ 本地 secrets.toml（已 gitignore，图形界面写入）。
+   绝不写进 config.toml / 日志 / 仓库。
+5. 不要为了让「回复更多 / 更快」放宽 config.toml 的安全默认值。
+6. 自学习产物（data/learned_skills.json）只作为提示词参考注入回复，**不得直接照发**；
+   条目可被用户随时停用，停用后不得再注入。
+
+## 本机环境事实（2026-10-01 实测）
+
+- 微信：Weixin 4.1.13.65，安装于 `D:\Program Files\Tencent\Weixin\Weixin.exe`；
+  多进程架构；主窗口标题「微信」，窗口类 `mmui::MainWindow`。
+- 主窗口经常被收进托盘（隐藏）；隐藏 / 最小化时 WGC 抓不到帧，需先 `ShowWindow` 唤出。
+- Python：项目自带 venv `.venv`（uv 创建，CPython 3.12.13）。
+  ⚠ PATH 上的 `python` 是坏的（指向不存在的 hermes-agent 解释器），一律用 `.venv\Scripts\python.exe`。
+- 依赖已装：mss、rapidocr-onnxruntime、opencv-python、numpy、pillow、pywinauto、
+  windows-capture、pyside6-essentials。
+- 用户本地模型运行时：**LM Studio**（服务端 `http://127.0.0.1:1234/v1`，已安装且常开；
+  2026-10-01 实测 wxbot 联通正常）。硬件：RTX 5060（8GB 显存）/ 32GB RAM / Ryzen 7 7800X3D
+  → 本地模型推荐 **Qwen3-8B（Q4_K_M）**；想更聪明可试 Qwen3-14B（部分卸载）。
+  config.toml 的 llm.base_url 已预填 LM Studio 地址。
+
+## 技术结论（实测，勿重复踩坑）
+
+- UIA 控件树：只有窗口框架层（标题栏按钮、导航标签，约 28 节点）；
+  聊天内容区 `MMUIRenderSubWindowHW` 是 GPU 自绘画布，**无子节点** → 必须走视觉。
+- 抓屏方案对比（实测）：
+
+  | 方案 | 窗口被遮挡时 | 结论 |
+  | --- | --- | --- |
+  | 直接屏幕抓取（mss） | ❌ 截到遮挡物 | 仅窗口在最前时可用（备选） |
+  | PrintWindow(PW_RENDERFULLCONTENT) | ❌ 全黑（mean 0.0） | 排除 |
+  | **WGC（windows-capture 包）** | ✅ 正常读到内容 | **采用** |
+
+  WGC 用法：`WindowsCapture(window_hwnd=..., draw_border=False, cursor_capture=False)`；
+  抓帧尺寸 ≈ 1186x1033（窗口 1200x1040），**点击坐标映射要处理偏移**（发送模块要处理）。
+- OCR：RapidOCR 识别质量很好（置信度普遍 0.9+）。
+
+## 模块与命令
+
+- 图形界面（推荐入口）：`.venv\Scripts\python.exe -m wxbot gui`
+- 状态：`.venv\Scripts\python.exe -m wxbot status`
+- 运行循环（等同 GUI 开关）：`.venv\Scripts\python.exe -m wxbot run [--interval 3]`
+- 厂商列表：`.venv\Scripts\python.exe -m wxbot providers`
+- 模型库：`.venv\Scripts\python.exe -m wxbot models`
+- 厂商连通自检：`.venv\Scripts\python.exe tools\check_provider_flow.py [厂商key]`
+- GUI 模型页行为自检：`.venv\Scripts\python.exe tools\check_gui_model_tab.py`
+- GUI 运行开关自检：`.venv\Scripts\python.exe tools\check_gui_run_switch.py`
+- 视觉识别自检（读真实微信会话列表）：`.venv\Scripts\python.exe tools\check_vision_read.py`
+- 未读检测调试（输出面板图与红点位置）：`.venv\Scripts\python.exe tools\debug_session_panel.py`
+- 点击映射自检（不发消息）：`.venv\Scripts\python.exe tools\check_send_dryrun.py --index 2`
+- 输入环节自检（不按回车）：`.venv\Scripts\python.exe tools\check_input_debug.py`
+- 真实发送测试（会发出一条消息）：`.venv\Scripts\python.exe tools\check_send_live.py`
+- 界面截图（评审用）：`.venv\Scripts\python.exe tools\shot_gui.py shots\run.png --page run --theme dark`
+- 界面原型（独立于主程序）：`prototype\redesign_prototype.py`、`prototype\预览原型.bat`
+- 学习：`.venv\Scripts\python.exe -m wxbot learn`（AI 复盘聊天记录、整理技能；需先配置模型）
+- 测试：`.venv\Scripts\python.exe -m unittest discover -s tests -t tests`（172 项全绿）
+  ⚠ `tests` 下没有 `__init__.py`，**必须带 `-t tests`**；写 `-t .` 会报
+  `ImportError: Start directory is not importable`。
+  ⚠ 本项目**没有装 pytest**，`python -m pytest` 会报 `No module named pytest`，别浪费一轮排查。
+
+## 实测踩坑（微信视觉自动化）
+
+1. **未读红点位置不能靠猜**：实测红点紧跟头像/名字（不是行最右侧），且左侧导航栏「微信」图标上
+   也有红点。判定要用「尺寸 + 圆形度」区分真红点与彩色头像（腾讯新闻 logo 含红会误报），
+   并用 x 偏移排除导航栏；再配合「会话摘要变化」作为备用信号（无红点也不漏）。
+2. **WGC 有旧帧**：抓屏会话刚建立时可能先返回操作前的画面。点击/输入后校验必须
+   `grab_bgr(hwnd, frames=3)` 取最后一帧，否则会误判"操作没生效"。
+3. **ctypes 剪贴板必须声明 restype**：64 位下 HANDLE 会被默认的 c_int 截断，导致
+   `GlobalLock` 拿到无效指针、剪贴板写入静默失败（表现为"粘贴没反应"）。
+4. **前台锁定**：非前台进程直接 `SetForegroundWindow` 常被 Windows 静默拒绝，
+   要先 `AttachThreadInput` 共享输入队列，仍失败再用 Alt 键解锁后重试。
+5. **PowerShell 传中文参数会被破坏**：需要中文时写成脚本文件里的字面量或传序号，
+   不要走命令行参数；控制台输出中文也可能变问号，诊断脚本用 unicode_escape 打印。
+6. **后台写入的实验结论（别重复试）**：
+   - `PostMessage(WM_LBUTTONDOWN/UP)` **可以**在微信处于后台时切换会话（光标不动）；
+   - `PostMessage(WM_CHAR)` **不行**，微信输入框只接受真实键盘输入（真实焦点）。
+   因此"打字"必须短暂抢前台；已用这些手段降低打扰：发送前等用户空闲（GetLastInputInfo）、
+   会话已打开时跳过点击、剪贴板粘贴（仅 2 次按键）、发送后还原光标与前台窗口
+   （`input.cursor_pos/set_cursor_pos`、`input.set_foreground(previous)`）。
+7. **WGC 静止窗口每次会话只出 1 帧 —— 别写"收集 N 帧"**：
+   实测 `frames=3` 恒定等满 timeout（曾设 8s → 每帧 9.02s），因为第 2、3 帧根本不来。
+   一次发送要抓 5~6 次屏，于是单个回复卡到 40s+，表现为"连续发送卡住"。
+   **正确做法**：每次抓屏用单帧（约 0.17s）；需要"操作后的新画面"就先 `sleep` 再抓一帧。
+8. **必须排除"自己刚发出的消息"**：自己的消息会出现在会话摘要里，
+   若不加判断会被当成新消息 → 自问自答无限循环（实测日志抓到过）。
+   做法：发送成功后记下 `(聊天, 文本)`，轮询时摘要与它匹配（含时间前缀容错）就跳过；
+   同时把会话标识做归一化（`老王！`/`老王!` 视为同一个会话），否则会被当成两个聊天。
+9. **微信不给"正打开的会话"显示未读红点** —— 靠红点会完全漏掉用户正看着的那个会话。
+   已补第三个信号：读聊天区气泡（`read_current_chat_text`）判断内容是否变化；
+   这同时也解决了"会话列表摘要被截断"的问题。
+10. **未读数量角标会被 OCR 读成会话名**：未读 3 条时，面板里 y 靠上的 `'3'`（角标）会排在
+   会话名之前，取 `group[0]` 会把整行丢掉。分组后要**剔除纯数字项**再取名字。
+11. `elif` 链陷阱：判断"摘要是否变化"用了 `elif key in self._last_preview:`，当摘要没变时
+   会命中该分支，**后面所有 elif 都不再执行**。补充判断要写成独立的 `if not reason and ...`。
+12. **判断"谁发的"要靠气泡左右位置，不要靠文本匹配**：对方消息气泡靠左、自己的靠右
+   （绿色气泡）。用「中心 x 相对聊天区中线的比例」判定（阈值必须按比例，窗口任意大小都成立）。
+   早期用「整段内容里是否含我刚发的文字」排除回显 → 聊天区内容累积后，
+   对方第二条消息也被吞（只回第一条）。现在直接只取 sender=="them" 的气泡做差分。
+13. 聊天区会滚动（旧的行从顶部消失），差分要**从后往前**找"上次见过且这次还在"的行，
+   不能只找公共前缀。
+14. **单点失败不能拖垮整体**（实测症状："回了几条就彻底卡住"）：
+   - `read_sessions()` 返回空时不能直接 `return []` —— 那样整个当前会话检测被跳过；
+   - 读不到标题时**不能清空 `_current_chat`** —— 状态一丢，后续检测全部失效。
+   原则：读不到就"沿用上次已知的值"，只有"明确读到标题但该会话不在列表里"才清空。
+15. 轮询里**只抓一帧**，供会话列表 / 标题 / 气泡三处复用（省一次抓屏 ≈ 0.2s）。
+16. **判断"要不要回"用"最后一条气泡是谁发的"，不要用"和上一轮比差异"**（实测症状：
+   会话正打开着 + 程序启动前就收到消息 → 没有红点 → 又被基线跳过 → 永远不回复）。
+   规则：`_latest_definite_bubble()` 取最后一条能确定发送方的气泡，
+   若是 `them` 且不等于 `_last_replied_text` → 需要回。
+17. **去重要精确，冷却期要短**：`_claimed_text`（已认领）+ `_last_replied_text`（已回复）
+   负责去重；`REPORT_COOLDOWN` 只是防相邻两轮重复上报，**不能设成 60s**，
+   否则用户连发时第二条会被挡（实测踩过）。当前 5s。
+
+- 核心模块：
+  - `wxbot/safety/gateway.py` —— 安全网关（白名单 / 静默 / 限速 / 熔断 / 随机延迟）
+  - `wxbot/brain/pipeline.py` —— 回复流水线（网关 → 技能闸门 → 生成 → 审查 → 计划）
+  - `wxbot/brain/skills.py` —— 技能系统（persona / memory / safety / group_policy / learned）
+  - `wxbot/theme.py` —— 主题（深/浅配色 + QSS + Switch/StatCard/StatusPill/Card 自定义控件）
+  - `wxbot/runner.py` —— 运行控制器（启动/停止开关 + 主循环 + 统计，GUI 与命令行共用）
+  - `wxbot/wechat/capture.py` —— WGC 抓屏与窗口可用性（frames>1 可取最后一帧，避开旧帧）
+  - `wxbot/wechat/input.py` —— 键鼠输入与剪贴板（ctypes；含前台解锁）
+  - `wxbot/wechat/vision_client.py` —— 会话识别 + 未读检测 + **真实发送**（四道校验）
+  - `wxbot/textutil.py` —— 名称归一化（全角/半角差异容错）
+  - `wxbot/providers.py` —— 厂商注册表（19 家）+ 模型元数据库（按名称推断上下文/模态/思考等级）
+  - `wxbot/brain/model_store.py` —— 模型库（data/models.json，每个厂商×模型一套参数）
+  - `wxbot/brain/llm.py` —— 模型引擎（OpenAI / Anthropic 双协议 + 思考等级落地）
+  - `wxbot/brain/learned.py` —— 自学习技能库（data/learned_skills.json，GUI 可逐条开关）
+  - `wxbot/brain/learner.py` —— 技能自学习器（AI 复盘聊天记录 → 技能条目）
+  - `wxbot/brain/memory.py` —— 短期记忆（data/chat_memory.json）
+    ⚠ 会话名**必须归一化后作 key**（否则「老王！」/「老王!」= 两份记忆，模型只看到一半对话）；
+    入库前要清洗角标数字与时间前缀。迁移脚本 `tools/migrate_memory.py`。
+  - `wxbot/brain/llm.py` —— LLM 引擎（本地 Ollama / LM Studio 与云端 OpenAI 兼容服务）
+  - `wxbot/gui.py` —— 图形界面（保存配置按模板重写 config.toml；未暴露字段自动继承）
+- 工具：`tools/probe_uia*.py|ps1`、`tools/smoke_vision.py`、`tools/test_capture.py`、
+  `tools/test_wgc.py`、`tools/check_local_llm.py`
+- GUI 启动：双击 `启动界面.bat`（等价于用 uv base pythonw 无窗口启动）。
+  ⚠ 不要从后台直接 `.venv\Scripts\pythonw.exe -m wxbot gui`——uv 的启动器会弹一个
+  Windows Terminal 控制台窗口，且关掉那个窗口会把 GUI 一起杀掉。
+
+## GUI 陷阱（踩过）
+
+PySide6 滚轮：`QComboBox` / `QSpinBox` / `QSlider` 默认会**用滚轮改值**（在 ScrollArea 里尤其坑，
+鼠标一扫模型就换了）。已用 `_NoWheelFilter` 拦截，滚动量转交外层滚动区域。
+两个易错点：① 方向 —— `delta > 0`（向上滚）对应滚动条值**增大**；
+② 不能一遇到有 `verticalScrollBar` 的控件就返回（短文本框 `maximum == 0` 滚不动，要继续往上找）。
+
+PySide6 里给 QGroupBox 建了子控件后，**必须把 QGroupBox 加进某个布局/父窗口**，
+否则它会被 Python GC 回收，连带子控件一起销毁，报
+`libshiboken: Internal C++ object already deleted`（症状是 init 阶段就崩）。
+
+QGroupBox 做「卡片」样式时，要给 `QGroupBox::title` 设 `background-color: <卡片底色>`，
+否则卡片边框会从标题文字中间穿过去，看起来像被划掉。
+
+未显式设 `objectName` 的 QPushButton 在深色 QSS 下会退回系统原生外观，对比度极低；
+要补一条通用 `QPushButton {...}` 兜底样式。日志富文本用 `QTextEdit`（`QPlainTextEdit` 无 setHtml）。
+改完样式务必**逐页截图自查**（`widget.grab().save(path)`）。
+
+QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
+`group.layout().addWidget(...)` 加的"正文"会被当成标题行的同级控件摆到**右边**并溢出卡片。
+想做成"标题一行 + 可折叠正文"，正确写法是外层 `QVBoxLayout` + 把标题行包成一个子 `QWidget`
+（见「模型」页的"高级设置"）。
+
+离屏截图（`QT_QPA_PLATFORM=offscreen`）**没有中文字体**，截出来全是 □，
+看不出任何排版问题 —— 视觉自查必须用真实显示（不设 `QT_QPA_PLATFORM`）跑 `shot_gui.py`。
+
+⚠ 用 `Start-Process ... -WindowStyle Hidden` 启动 GUI 会把 `SW_HIDE` 传给 Qt 主窗口：
+进程在跑、窗口标题也存在，但 `IsWindowVisible=False`，人眼完全看不到。
+后台启动 GUI **不要加这个参数**。
+
+## 降低"机器特征"的既有措施（改动前请确认不要破坏）
+
+- 回复随机延迟（config `safety.min_reply_delay_sec` / `max_reply_delay_sec`，默认 2~6s）
+- 三级限速 + 静默时段 + 熔断（`safety` 段）
+- 点击坐标**随机抖动 + 平滑移动**（`_do_send` 里的 `self._rng`；不要改回固定像素点）
+- 粘贴后按文本长度停顿再回车（模拟打字节奏）
+- 绝不主动发起对话；群聊默认要求 @（group_policy）
+
+## 人设（persona）——已独立成页
+
+配置在 `[skills.persona]`：`identity/tone/formality/length/emoji/catchphrases/avoid`。
+提示词拼装入口：`brain/skills.py: build_persona_prompt()` + `SkillRegistry.build_system_prompt()`。
+人设页预览、「试生成」、真实回复都走同一条路径 —— 改动时务必保持"预览 = 实际注入"。
+
+**⚠️ 不许暴露 AI 身份必须是硬性规则**（`MANDATORY_RULES`），永远追加在系统提示词**末尾**：
+把它放进可编辑的提示词里，用户一改就容易写出「你是代回复助手，但不要暴露身份」
+这种自相矛盾的话，模型就会自曝（实测踩过）。
+默认提示词 `DEFAULT_BASE_PROMPT` 也不能自称"代回复助手"。
+
+自检：`tools/check_persona_identity.py`（是否泄漏 AI 身份）、`tools/compare_persona_models.py`（换模型对比）。
+
+### 系统提示词与人设的分工（v2.3.1）
+
+最终注入顺序固定：`默认提示词 → system_prompt（留空则跳过）→ 各技能 → MANDATORY_RULES`。
+所以**日常只改人设页**，`config.toml` 的 `[llm].system_prompt` 保持空字符串。
+
+它已被收进「模型」页**默认折叠的「高级设置」**（`gui.py` 的 `adv_group`），
+并带实时冲突检测 `_check_sys_prompt_conflict()`：命中
+`助手/机器人/AI/代回复/程序/模型` 任一字眼就弹橙色警告。
+新增风险词时同步改这个列表；**不要**把 system_prompt 重新挪回主区域。
+
+自检：`tools/check_sys_prompt_conflict.py`。
+
+## 模型参数自动预填（v2.4，改动前必读）
+
+「模型」页的**上下文 / 输入模态 / 思考等级 / 最大输出**会被「按名称自动预填」整体覆盖。
+这条链路踩过两次，**改之前先看这里**：
+
+1. **拉列表 ≠ 改参数。** `_on_models_ok` 只允许在**当前模型真的变了**时调
+   `_on_model_selected()`。早先它在 `blockSignals` 填充下拉框之后又无条件重跑了一遍
+   （而且跑两次），导致点一下「获取模型列表」就把用户手工勾的「图片」抹掉。
+   信号已经 `blockSignals`，**不要再手动补调**。
+2. **本地厂商不能短路规则表。** `lookup_model_meta` 里 `provider.local` 分支只覆盖
+   **上下文**（固定 8K 保守值），模态 / 思考等级仍走 `_RULES`。
+   早先直接 `return ("text",)`，把整张表作废，`minicpm-v` / `qwen2-vl` 全被判成不支持图片。
+3. **强视觉标识优先于家族默认值。** `_VISION_RE`（vl / vision / omni / llava / internvl /
+   `-v-<数字>`）在家族规则**之后**做兜底升级，否则 `^llama-3` 会把 `llama-3.2-vision` 否掉。
+4. **editable QComboBox 的 `setCurrentText()` 不触发 `currentIndexChanged`**
+   （只改输入框文字、index 不动）。所以"手输模型名"不会触发预填，只有真从下拉里选才会。
+   测试里要模拟用户点选必须用 `setCurrentIndex()`。
+
+排查工具：`tools/check_model_modalities.py`（比对模型库与名称元数据）、
+`tools/fix_model_modalities.py [--apply]`（只修 modalities，已备份）。
+回归测试：`tests/test_gui_model_fetch.py`、`tests/test_providers.py::LocalModelMetaTests`。
+
+## 下一步（按顺序）
+
+1. 托盘常驻 + 全局急停热键（停止开关之外的"一键刹车"）
+2. 用「文件传输助手」做 dry_run → auto 的完整回归
+3. PyInstaller 打包成 exe
+
+（发送器已完成：会话切换 → 标题校验 → 输入 → 输入框校验 → 回车 → 发送后校验）

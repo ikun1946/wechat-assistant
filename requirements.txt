@@ -1,0 +1,17 @@
+# 项目依赖（安装：uv pip install --python .venv\Scripts\python.exe -r requirements.txt）
+#
+# 视觉路线（当前采用）：
+mss>=10.2                   # 截屏
+rapidocr-onnxruntime>=1.4   # 离线 OCR（自带中英文模型，无需联网）
+opencv-python>=5.0          # 图像处理（红点检测、区域裁剪等）
+numpy>=2.5
+pillow>=12.3
+#
+# UIA 辅助（探测用，已安装）：
+pywinauto>=0.6.9
+#
+# 图形界面：
+pyside6-essentials>=6.8
+#
+# 后续按需：
+# pyperclip>=1.9            # 剪贴板（发送中文时用粘贴更稳）

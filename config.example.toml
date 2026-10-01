@@ -1,0 +1,50 @@
+# wxbot 配置模板：把本文件复制为 config.toml 后修改。
+# 安全提醒：默认参数已经是保守值；白名单为空时「谁都不回」。
+
+[app]
+mode = "dry_run"    # dry_run=只记录不发送（先空跑验证）；auto=真实全自动发送
+route = "auto"      # auto | uia | vision —— 收发技术路线，auto=按探测结果决定
+
+[whitelist]
+enabled = true      # 白名单总开关（保持开启）
+allow_all = false   # true=不限制白名单（高风险，不推荐）
+chats = []          # 只回复这些联系人/群的「精确名称」，如 "张三"、"家人群"
+
+[safety]
+quiet_hours = ["23:00-08:00"]   # 静默时段（可跨零点，可写多段）
+max_per_minute = 2              # 每分钟最多发送条数
+max_per_hour = 20               # 每小时最多发送条数
+max_per_day = 60                # 每天最多发送条数
+min_reply_delay_sec = 2.0       # 回复前随机延迟下限（秒）
+max_reply_delay_sec = 6.0       # 回复前随机延迟上限（秒）
+auto_trip_on_failures = 5       # 连续发送失败 N 次自动熔断停机
+
+[reply]
+engine = "rules"          # rules=关键词规则；llm=大模型生成
+default_enabled = false   # 无规则命中时是否使用默认回复
+default_text = ""         # default_enabled=true 时生效
+
+[[reply.rules]]
+keywords = ["在吗", "在么"]
+reply = "在的，稍后回你～"
+
+[[reply.rules]]
+keywords = ["晚安"]
+reply = "晚安～"
+
+[llm]
+# 厂商与模型。推荐直接用图形界面「模型」页：选厂商 → 获取模型列表 → 逐模型调参数。
+# 支持的厂商见 `python -m wxbot providers`（DeepSeek / Kimi / 智谱 / 通义 / 豆包 / MiniMax /
+# 混元 / 硅基流动 / OpenAI / Claude / Gemini / Grok / Groq / OpenRouter / LM Studio / Ollama …）
+provider = "lmstudio"                # 厂商 key
+base_url = "http://127.0.0.1:1234/v1"   # 本地 LM Studio；Ollama 用 11434；云端用厂商地址
+model = ""                           # 模型名（获取列表后选择）
+api_style = "openai"                 # openai=/chat/completions；anthropic=/messages
+api_key_env = ""                     # 本地留空；云端填环境变量名，如 DEEPSEEK_API_KEY
+temperature = 0.8
+max_tokens = 200                     # 最大输出
+context_length = 32768               # 该模型可用上下文
+modalities = ["text"]                # 输入模态：text/image/audio/video/file
+thinking_level = "auto"              # auto/off/low/medium/high（按厂商自动落地）
+timeout_sec = 30.0
+system_prompt = ""    # 留空使用内置默认提示词（推荐）。自己改写时注意别和「人设」自相矛盾。

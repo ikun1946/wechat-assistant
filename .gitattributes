@@ -1,0 +1,13 @@
+# 换行符规范
+# 默认：仓库内存 LF，检出时按平台自动转换
+* text=auto
+
+# Windows 批处理必须保持 CRLF，否则别人克隆下来双击会打不开
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.ico binary
