@@ -197,13 +197,30 @@ def _can_scroll_inside(widget: QWidget) -> bool:
 
 
 def install_wheel_guard(widget: QWidget) -> int:
-    """给 widget 及其所有子控件装上滚轮过滤，返回安装数量。"""
+    """给 widget 及其所有子控件装上滚轮过滤，返回安装数量。
+
+    ⚠ v2.6.3 修（用户报"整个页面滚动有问题"）：
+    除了 guarded 类型，**还给所有直接放在 QScrollArea 里的页面 widget
+    也装上过滤器**。空白的页面光标下没有 guarded 控件，wheel 没人接——Qt 默认
+    QScrollArea 滚动路径在 PySide6 / 某些事件投递下不工作。
+
+    装了过滤器之后，无论鼠标停在页面哪里（控件上还是纯空白），
+    都能走 `_scroll_ancestor` 让滚动条动起来。
+    """
     guard = _NoWheelFilter(widget)
     count = 0
+    targets = set()
     for child in widget.findChildren(QWidget):
         if isinstance(child, _WHEEL_GUARDED_TYPES + _WHEEL_GUARDED_TEXT_TYPES):
-            child.installEventFilter(guard)
-            count += 1
+            targets.add(child)
+    # 找所有 QScrollArea，把它们装的 page widget 也加进来
+    for scroll in widget.findChildren(QScrollArea):
+        page_widget = scroll.widget()
+        if page_widget is not None:
+            targets.add(page_widget)
+    for target in targets:
+        target.installEventFilter(guard)
+        count += 1
     return count
 
 NAV_ITEMS = (

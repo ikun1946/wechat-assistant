@@ -1,4 +1,4 @@
-"""滚轮过滤器的行为测试（离屏，不需要真实窗口）。
+﻿"""滚轮过滤器的行为测试（离屏，不需要真实窗口）。
 
 回归背景（v2.6.2）：用户报"滚动窗口时鼠标正好在文本框上，窗口会闪动"。
 根因是旧规则"文本框内容溢出就把滚轮给它"—— 而内容是在**光标底下**移动的，
@@ -184,3 +184,59 @@ class WheelGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallCoverageTests(unittest.TestCase):
+    """v2.6.3：滚轮过滤器必须装到页面 widget 上，否则空白处滚轮不受控。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_install_covers_page_widgets(self):
+        """install_wheel_guard 应当给每个 QScrollArea 里的 page widget 也装上过滤器。"""
+        from PySide6.QtWidgets import QScrollArea, QWidget
+
+        host = QWidget()
+        area = QScrollArea(host)
+        area.setWidgetResizable(True)
+        content = QWidget()
+        area.setWidget(content)
+        host.show()
+        self.app.processEvents()
+
+        count = gui.install_wheel_guard(host)
+        guard = gui._NoWheelFilter(host)
+        result = guard.eventFilter(content, _FakeWheel(120))
+        self.assertTrue(result, "页面 widget 上的滚轮必须由过滤器处理")
+        self.assertGreater(count, 0, "应至少装了一个过滤器")
+        host.close()
+
+    def test_page_widget_wheel_moves_scroll_bar(self):
+        """页面 widget 自身收到 wheel 时，过滤器要把滚动条往上推。"""
+        from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
+
+        host = QWidget()
+        area = QScrollArea(host)
+        area.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        filler = QWidget()
+        filler.setFixedHeight(900)
+        layout.addWidget(filler)
+        layout.addWidget(QLabel("底部"))
+        area.setWidget(content)
+        host.resize(400, 200)
+        host.show()
+        self.app.processEvents()
+
+        gui.install_wheel_guard(host)
+        guard = gui._NoWheelFilter(host)
+        bar = area.verticalScrollBar()
+        bar.setValue(0)
+        guard.eventFilter(content, _FakeWheel(120))
+        self.app.processEvents()
+        self.assertGreater(
+            bar.value(), 0, "页面 widget 上的 wheel 应让滚动条动起来"
+        )
+        host.close()
