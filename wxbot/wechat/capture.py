@@ -34,33 +34,108 @@ SW_RESTORE = 9
 
 MAIN_TITLES = {"微信", "Weixin", "WeChat"}
 
-# WGC 抓屏线程的"保活名单"。
-# ⚠ 这是一个实测踩过的原生崩溃（v2.6.5 修）：
-#   `grab_frame` 里 `thread.join(timeout=0.5)` 超时就直接返回，局部的 `capture`
-#   随即被 GC 回收 → **原生 WGC 句柄被释放**，而后台线程还在用它 →
-#   0xC0000005 硬崩（症状：循环启停第 2 轮必崩，程序直接闪退）。
-#   停不下来的会话就丢进这里保活 —— 宁可泄漏一次，也绝不能让原生对象被提前释放。
-_KEEPALIVE: list[tuple[object, threading.Thread]] = []
-
-# WGC 会话**全局串行**。faulthandler 抓到的崩溃栈证明：崩的是**抓屏线程自己**，
-# 卡在 `windows_capture/__init__.py:241` 的原生 `capture.start()` 里 ——
-# Windows 的图形捕获不允许同一窗口有两个活跃会话，第二个会话一开就访问冲突。
+# ---------------------------------------------------------------------------
+# 长驻 WGC 会话（v2.6.6 —— 这是闪退的真正修法）
+# ---------------------------------------------------------------------------
+# 早先每次抓帧都新建 + 销毁一个 WGC 会话。faulthandler 实测：会话攒到一定数量后，
+# 下一个会在**原生 `capture.start()` 里访问冲突**（0xC0000005，崩的是抓屏线程自己）。
+# 3 秒轮询 = 每 3 秒一个会话，跑上几小时必然踩到 —— 也就是说程序一直带着一颗
+# 定时炸弹，跟手动启停无关（启停只是让它提前引爆）。
 #
-# 所以：同一时刻只允许一个会话；上一个没死透就**放弃这一帧**（返回 None）。
-# 上层 `poll_new_messages` 见到 None 会安静地跳过这一轮 —— 少抓一帧，
-# 远比崩掉整个程序好。
-_CAPTURE_LOCK = threading.Lock()
-
-# 还在跑的 WGC 会话线程。faulthandler 实测：崩的是**抓屏线程自己**，卡在
-# `windows_capture/__init__.py:241` 的原生 `capture.start()` 里。
-# 只要还有一个旧会话没退出就对同一窗口再开一个，就会撞车 —— Windows 图形捕获
-# 不支持这种交叠。所以这里做硬闸：**有存活会话就不开新的**，宁可这一帧返回 None。
-_LIVE_CAPTURE_THREADS: list[threading.Thread] = []
+# 正确用法是一个**长驻**会话：`start_free_threaded()` 专门为这个设计。
+# 窗口没变化时本来就没有新帧，OCR 那边比的是内容，返回"最近一帧"和每次重抓等价，
+# 反而省掉了反复建销的开销。
+_SESSION_LOCK = threading.Lock()
+_SESSION: "_WgcSession | None" = None
 
 
-def _live_capture_count() -> int:
-    _LIVE_CAPTURE_THREADS[:] = [t for t in _LIVE_CAPTURE_THREADS if t.is_alive()]
-    return len(_LIVE_CAPTURE_THREADS)
+class _WgcSession:
+    """一个长驻的 WGC 会话：帧一到就存起来，抓帧时等"比上次新"的那一帧。"""
+
+    def __init__(self, hwnd: int):
+        from windows_capture import WindowsCapture
+
+        self.hwnd = hwnd
+        self._lock = threading.Lock()
+        self._new_frame = threading.Event()
+        self._image: np.ndarray | None = None
+        self._seq = 0
+        self._closed = False
+
+        capture = WindowsCapture(window_hwnd=hwnd, draw_border=False, cursor_capture=False)
+
+        @capture.event
+        def on_frame_arrived(frame, capture_control):
+            try:
+                buffer = frame.frame_buffer   # 零拷贝视图，必须立刻复制
+                image = np.array(buffer)
+                if image.ndim == 3 and image.shape[2] == 4:
+                    image = image[:, :, :3]
+                with self._lock:
+                    self._image = np.ascontiguousarray(image)
+                    self._seq += 1
+                self._new_frame.set()
+            except Exception:  # noqa: BLE001 - 回调里绝不能抛
+                pass
+
+        @capture.event
+        def on_closed():
+            self._closed = True
+            self._new_frame.set()
+
+        self._capture = capture
+        self._control = capture.start_free_threaded()
+
+    def grab(self, timeout: float, settle: float) -> np.ndarray | None:
+        """等一帧"比上次新"的画面。
+
+        关键：窗口静止时 WGC **根本不会送新帧**，所以绝不能每次都等满 timeout
+        （那会让 3 秒轮询变成 2 秒一帧的慢动作）。策略：
+        - 已经有缓存帧 → 只短等一会儿（`settle`），没新帧就直接用缓存
+          （内容没变，缓存帧就是当前画面）；
+        - 一帧都还没有（刚建会话）→ 才等满 `timeout`。
+        """
+        with self._lock:
+            have_cache = self._image is not None
+
+        wait = (settle if have_cache else timeout)
+        deadline = time.time() + max(0.05, wait)
+        while time.time() < deadline:
+            if self._new_frame.wait(timeout=0.05):
+                self._new_frame.clear()
+                break
+            if self._closed:
+                break
+
+        with self._lock:
+            if self._image is None:
+                return None
+            return self._image.copy()
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._control.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _get_session(hwnd: int) -> "_WgcSession | None":
+    """拿到（必要时建立）长驻会话。失败返回 None，调用方按"这一帧没抓到"处理。"""
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is not None and _SESSION.hwnd == hwnd and not _SESSION._closed:
+            return _SESSION
+        if _SESSION is not None:
+            try:
+                _SESSION.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            _SESSION = _WgcSession(hwnd)
+        except Exception:  # noqa: BLE001
+            _SESSION = None
+        return _SESSION
 
 
 def find_wechat_windows() -> list[dict]:
@@ -118,104 +193,19 @@ def grab_frame(
     这里保留 frames/settle 参数只是为了让调用方能表达"最多等到几帧"，
     默认 1 帧即可；timeout 是"完全没有帧"时的兜底。
 
-    ⚠ v2.6.5：整个会话在 `_CAPTURE_LOCK` 里**串行**执行。Windows 图形捕获不允许
-    同一窗口有两个活跃会话，并发/交叠开会直接在原生 `capture.start()` 里访问冲突
-    （0xC0000005，faulthandler 实测）。拿不到锁就返回 None，由上层跳过这一轮。
+    ⚠ v2.6.6：改用**长驻** WGC 会话（`_WgcSession`），不再每次抓帧都建/销一个会话。
+    每 3 秒建一个会话，跑久了必然在原生 `capture.start()` 里访问冲突（0xC0000005）。
+    窗口没变化时本来就没有新帧，而调用方比的是内容 —— 返回"最近一帧"与重抓等价。
     """
     try:
-        from windows_capture import WindowsCapture
+        import windows_capture  # noqa: F401
     except ImportError:
         return None
 
-    # 拿不到锁 = 上一帧的会话还没收干净，**不要**再开一个（会原生崩溃）
-    if not _CAPTURE_LOCK.acquire(timeout=0.05):
+    session = _get_session(int(hwnd))
+    if session is None:
         return None
-    try:
-        # 硬闸：还有存活的 WGC 会话就不开新的（交叠开会原生崩溃）
-        if _live_capture_count() > 0:
-            return None
-        return _grab_frame_locked(
-            WindowsCapture, hwnd, timeout=timeout, frames=frames, settle=settle
-        )
-    finally:
-        _CAPTURE_LOCK.release()
-
-
-def _grab_frame_locked(
-    WindowsCapture, hwnd: int, *, timeout: float, frames: int, settle: float
-):
-    """真正的抓屏实现。调用方必须已持有 `_CAPTURE_LOCK`。"""
-    wanted = max(1, int(frames))
-    holder: dict = {}
-    seen = 0
-    first_frame_at: float | None = None
-
-    try:
-        capture = WindowsCapture(
-            window_hwnd=hwnd, draw_border=False, cursor_capture=False
-        )
-    except TypeError:
-        capture = WindowsCapture(window_hwnd=hwnd)
-
-    done = threading.Event()
-
-    @capture.event
-    def on_frame_arrived(frame, capture_control):
-        nonlocal seen, first_frame_at
-        try:
-            buffer = frame.frame_buffer
-            # frame_buffer 是零拷贝视图，必须立刻复制
-            image = np.array(buffer)
-            if image.ndim == 3 and image.shape[2] == 4:
-                holder["image"] = image[:, :, :3].copy()
-            elif image.ndim == 3:
-                holder["image"] = image.copy()
-            else:
-                holder["image"] = None
-            seen += 1
-            now = time.time()
-            if first_frame_at is None:
-                first_frame_at = now
-            if seen >= wanted or (now - first_frame_at) >= settle:
-                capture_control.stop()
-                done.set()
-        except Exception as exc:  # noqa: BLE001
-            holder["error"] = repr(exc)
-            capture_control.stop()
-            done.set()
-
-    @capture.event
-    def on_closed():
-        done.set()
-
-    def _run():
-        try:
-            capture.start()
-        except Exception as exc:  # noqa: BLE001
-            holder["error"] = repr(exc)
-            done.set()
-
-    thread = threading.Thread(target=_run, daemon=True, name="wgc-capture")
-    _LIVE_CAPTURE_THREADS.append(thread)  # 硬闸要看到它
-    thread.start()
-    done.wait(timeout=timeout)
-
-    # ⚠ 关键：必须**先停掉原生抓屏、再等线程真正结束**，才让 capture 离开作用域。
-    # 只 join 一小段时间是不够的 —— 超时路径下后台线程还活着，
-    # Python 一回收 capture，原生 WGC 句柄就没了，线程里再碰一下就硬崩。
-    control = getattr(capture, "capture", None)
-    if control is not None:
-        try:
-            control.stop()
-        except Exception:  # noqa: BLE001 - 停止失败也不能让它被提前回收
-            pass
-    thread.join(timeout=2.0)
-    if thread.is_alive():
-        # 实在停不下来：保活，绝不能让 GC 在线程还在用的时候回收它
-        _KEEPALIVE.append((capture, thread))
-        if len(_KEEPALIVE) > 8:  # 只留最近的，旧的已结束的可以丢
-            _KEEPALIVE[:] = [item for item in _KEEPALIVE if item[1].is_alive()][-8:]
-    return holder.get("image")
+    return session.grab(timeout=timeout, settle=settle)
 
 
 def grab_bgr(

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -301,6 +303,78 @@ class WrappedBubbleTests(unittest.TestCase):
         pending = client._pending_incoming("老王！", bubbles)
         self.assertEqual(len(pending), 1)
         self.assertIn("第二行", pending[0].text)
+
+
+class PersistentWgcSessionTests(unittest.TestCase):
+    """v2.6.6：WGC 必须是**长驻会话**，不能每次抓帧都建/销一个。
+
+    回归背景：faulthandler 实测，会话攒到一定数量后，下一个会在**原生
+    `capture.start()` 里访问冲突**（0xC0000005，崩的是抓屏线程自己）。
+    3 秒轮询 = 每 3 秒一个会话，跑上几小时必然踩到。
+    （这一组用例不碰 Qt，也不需要真实窗口）
+    """
+
+    def test_missing_windows_capture_returns_none(self):
+        """没装 windows_capture 时要安静地返回 None，而不是抛异常。"""
+        from wxbot.wechat import capture as cap
+
+        saved = cap._SESSION
+        cap._SESSION = None
+        try:
+            # 真实的 0 号 hwnd 不可能抓到任何东西
+            self.assertIsNone(cap.grab_frame(0, timeout=0.2, frames=1, settle=0.0))
+        finally:
+            cap._SESSION = saved
+
+    def test_session_is_reused_not_recreated(self):
+        """同一个 hwnd 连续取会话，必须是同一个对象（而不是每次新建）。"""
+        from wxbot.wechat import capture as cap
+
+        class _FakeSession:
+            def __init__(self, hwnd):
+                self.hwnd = hwnd
+                self._closed = False
+                self.grab_calls = 0
+
+            def grab(self, timeout, settle):
+                self.grab_calls += 1
+                return np.zeros((4, 4, 3), dtype=np.uint8)
+
+            def close(self):
+                self._closed = True
+
+        saved = cap._SESSION
+        fake = _FakeSession(123)
+        cap._SESSION = fake
+        try:
+            self.assertIs(cap._get_session(123), fake, "同一 hwnd 应复用同一会话")
+            self.assertIs(cap._get_session(123), fake, "再次取也还是同一个")
+            # 会话已关闭 → 应该重建（而不是继续用一个废会话）
+            fake._closed = True
+            self.assertIsNot(cap._get_session(123), fake, "会话失效后要重建")
+        finally:
+            cap._SESSION = saved
+
+    def test_grab_returns_cached_frame_quickly(self):
+        """窗口静止时 WGC 不会送新帧，grab 必须**短等**后返回缓存，不能等满 timeout。"""
+        from wxbot.wechat.capture import _WgcSession
+
+        session = _WgcSession.__new__(_WgcSession)  # 不跑 __init__（那会真开会话）
+        session._lock = threading.Lock()
+        session._new_frame = threading.Event()
+        session._image = np.full((4, 4, 3), 7, dtype=np.uint8)
+        session._seq = 1
+        session._closed = False
+
+        start = time.perf_counter()
+        image = session.grab(timeout=3.0, settle=0.2)
+        elapsed = time.perf_counter() - start
+
+        self.assertIsNotNone(image, "有缓存帧就该返回它")
+        self.assertEqual(int(image[0, 0, 0]), 7)
+        self.assertLess(
+            elapsed, 1.0, f"有缓存时应短等（settle），不该等满 timeout（实测 {elapsed:.2f}s）"
+        )
 
 
 if __name__ == "__main__":

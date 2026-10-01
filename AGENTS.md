@@ -203,6 +203,31 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 进程在跑、窗口标题也存在，但 `IsWindowVisible=False`，人眼完全看不到。
 后台启动 GUI **不要加这个参数**。
 
+## WGC 抓屏：必须长驻会话，不能每次重建（v2.6.6，最重要的一条）
+
+**每一帧都新建 + 销毁一个 WGC 会话，跑久了必崩。** faulthandler 实测的栈：
+
+```
+Current thread:  windows_capture/__init__.py:241 in start   ← 崩的是抓屏线程自己
+Thread (runner): capture.py → done.wait()                   ← 正等着这次抓屏
+Thread (main):    runner.py:154 in stop → Thread.join()
+```
+
+`0xC0000005`，Windows 图形捕获在"同一窗口反复建/销会话"这个模式上原生就不稳。
+3 秒轮询 = 每 3 秒一个会话，**跑上几小时必然踩到** —— 程序一直带着这颗定时炸弹，
+手动"关开关再开"只是让它提前引爆。
+
+现在的做法（`wxbot/wechat/capture.py`）：
+
+- `_WgcSession`：**一个长驻会话**，用 `start_free_threaded()` 启动（专为此设计）；
+- 帧一到就存进 `_image` 并置位 `_new_frame`；
+- `_get_session(hwnd)`：同 hwnd 且未关闭就**复用**，失效才重建；
+- `grab()`：**有缓存帧时只短等 `settle`**，没新帧直接返回缓存 ——
+  窗口静止时 WGC 本来就不送新帧，绝不能每次等满 `timeout`（否则 3 秒轮询变 2 秒慢动作）；
+- 实测：连续抓 40 帧全成功（原来第 2 轮就崩）；反复启停 4 轮全过；整轮 poll 784ms。
+
+**别再退回"每次一帧建一个会话"**，也**别用 stop/start 来换配置**（见上一条）。
+
 ## 配置热更新：别 stop/start（v2.6.5）
 
 **换配置时不要「停掉 Runner 再建一个」** —— 每建一个新 Runner 都会走到 WGC 抓屏，
