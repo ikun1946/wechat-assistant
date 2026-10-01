@@ -264,6 +264,37 @@ QGroupBox 只能配**竖向**布局：`group.setLayout(QHBoxLayout())` 之后往
 
 回归测试：`tests/test_bubbles.py::WrappedBubbleTests`。
 
+## 生成失败的重试与熔断（v2.5.0，改动前必读）
+
+真实症状（用户日志）：模型一直连不上时，日志每 34 秒重复一次
+「识别到新消息 ← 你好 / 生成失败 timed out」，**无限循环**；被网关拦截的
+「微信团队」也一轮轮重复上报。两个原因：
+
+1. **`gateway.note_failure()` 以前只在"发送失败"时调用**，生成失败不计数 ——
+   `safety.auto_trip_on_failures` 形同虚设。现在生成失败也会 `note_failure()`，
+   成功发送则 `note_success()`。
+2. **没有任何重试上限**。现在 `Runner` 按「会话+文本」指纹记住处理进度
+   （`_decisions` / `_attempts` / `_retry_after`）：
+   - 拦截 / 跳过 / 发送失败 = **终态**，同一条不再重复处理；
+   - 生成失败 = 退避重试 `RETRY_BACKOFF_SEC`，超过 `MAX_GENERATE_ATTEMPTS` 次
+     就记为放弃并**打日志**，**新消息不受影响**照常处理。
+   - `stop()` 会清空这三张表，重启后重新开始。
+
+**不要**用「清空 `_retry_after`」的方式在生产代码里绕过退避 ——
+那只是测试里模拟"时间过去了"的手法。
+
+## 本地模型慢 / 超时的排查（v2.5.0）
+
+```powershell
+.\.venv\Scripts\python.exe tools\check_local_llm_speed.py    # 各模型实际耗时
+.\.venv\Scripts\python.exe tools\check_local_llm_timeout.py  # 复现程序真实请求
+```
+
+实测（RTX 5060 8GB，2026-10-01）：**同时加载 4 个模型**（9B + 3 个小模型）时
+`llama-server` 吃掉 7.1GB，同一提示词 `minicpm-v-4.6` 要 7~12s、
+`gemma-4-e2b` 要 16~30s，直接顶穿 30s 超时。
+**排查本地模型超时，先看 LM Studio 里加载了几个模型** —— 8GB 显卡只该常驻 1~2 个。
+
 ## 下一步（按顺序）
 
 1. 托盘常驻 + 全局急停热键（停止开关之外的"一键刹车"）

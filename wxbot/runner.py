@@ -26,6 +26,20 @@ STATE_ERROR = "error"
 
 DEFAULT_POLL_INTERVAL = 3.0
 
+# 生成失败的重试策略。
+# 以前没有任何上限：模型一直不恢复（比如本地服务挂了）就会变成
+# 「每 34 秒重试同一条消息」的死循环，日志被刷满、CPU 空转。
+# 现在：退避重试，超过上限就放弃这一条（**新消息不受影响**照常处理）。
+MAX_GENERATE_ATTEMPTS = 3
+RETRY_BACKOFF_SEC = (5.0, 20.0, 60.0)
+
+
+def _fingerprint(message: IncomingMessage) -> str:
+    """消息指纹：同一个会话里的同一条消息，跨轮询要认得出是同一条。"""
+    from .textutil import normalize_name
+
+    return f"{normalize_name(message.chat_name)}|{normalize_name(message.text)}"
+
 
 @dataclass
 class RunnerStats:
@@ -78,6 +92,13 @@ class Runner:
         self._stop = threading.Event()
         self.state = STATE_STOPPED
         self.stats = RunnerStats()
+        # 按「会话 + 消息文本」记住已经处理到哪一步了。
+        # 没有它，一次生成失败就会让同一条消息被无限重试（实测症状：
+        # 日志里每 34 秒重复一次「识别到新消息 ← 你好 / 生成失败 timed out」），
+        # 被网关拦截的消息也会一轮轮重复上报、白白消耗轮询。
+        self._decisions: dict[str, str] = {}   # 指纹 → 已下的结论（终态，不再重试）
+        self._attempts: dict[str, int] = {}    # 指纹 → 已尝试次数
+        self._retry_after: dict[str, float] = {}  # 指纹 → 下次允许重试的时刻
 
     # ---------- 对外接口 ----------
     @property
@@ -112,6 +133,9 @@ class Runner:
             return False
         self._thread = None
         self.state = STATE_STOPPED
+        self._decisions.clear()
+        self._attempts.clear()
+        self._retry_after.clear()
         self._log("runner_stop", **self._stats_dict())
         self._emit("stopped", "已停止：不再识别微信，也不执行任何后续动作")
         return True
@@ -171,6 +195,12 @@ class Runner:
             return []
 
         for message in messages:
+            fingerprint = _fingerprint(message)
+            hold = self._hold_reason(fingerprint)
+            if hold:
+                # 已经有结论 / 还在退避窗口内 / 已经放弃 —— 静默跳过，
+            # 不要再刷「识别到新消息」，否则日志会被同一条刷屏。
+                continue
             self.stats.received += 1
             self.stats.last_message = f"{message.chat_name}：{message.text}"
             self._emit(
@@ -180,6 +210,9 @@ class Runner:
             )
             result = self._pipeline.handle(message)
             if result.action == "replied":
+                self._attempts.pop(fingerprint, None)
+                self._retry_after.pop(fingerprint, None)
+                self._decisions[fingerprint] = "replied"
                 self.stats.replied += 1
                 can_send = getattr(self._client, "can_send", False)
                 if self._config.mode == "auto" and can_send:
@@ -187,9 +220,12 @@ class Runner:
                     if ok:
                         self.stats.sent += 1
                         self._pipeline.note_sent(message, result)
+                        self._gateway.note_success()
                         self._emit("reply", f"已发送 → {message.chat_name}：{result.reply_text}")
                     else:
+                        # 发送失败 → 记为终态：同一条不再重发（重发会打扰对方）
                         self._gateway.note_failure()
+                        self._decisions[fingerprint] = "send_failed"
                         detail = getattr(self._client, "last_send_detail", "")
                         self._emit(
                             "error",
@@ -203,16 +239,50 @@ class Runner:
                         delay=result.delay_sec,
                     )
             elif result.action == "denied":
+                # 拦截是**终态**：不在白名单就永远不该回，重试毫无意义
+                self._decisions[fingerprint] = f"denied:{result.reason}"
                 self.stats.denied += 1
                 self._emit("info", f"已拦截（{result.reason}）← {message.chat_name}")
             elif result.action == "skipped":
+                self._decisions[fingerprint] = f"skipped:{result.reason}"
                 self.stats.skipped += 1
                 self._emit("info", f"未回复（{result.reason}）← {message.chat_name}")
             else:
+                # 生成失败：退避后重试，但**必须有上限** —— 否则模型一直不恢复
+                # 就会变成每 34 秒重试一次的死循环（实测踩过）。
                 self.stats.errors += 1
                 self.stats.last_error = result.reason
-                self._emit("error", f"生成失败：{result.reason}")
+                self._gateway.note_failure()  # 让熔断阈值真的能拦住生成失败
+                attempt = self._attempts.get(fingerprint, 0) + 1
+                self._attempts[fingerprint] = attempt
+                if attempt >= MAX_GENERATE_ATTEMPTS:
+                    self._decisions[fingerprint] = f"gave_up:{result.reason}"
+                    self._emit(
+                        "error",
+                        f"生成失败已重试 {attempt} 次，放弃这条 ← {message.chat_name}："
+                        f"{result.reason}（新消息会正常处理）",
+                    )
+                else:
+                    delay = RETRY_BACKOFF_SEC[min(attempt - 1, len(RETRY_BACKOFF_SEC) - 1)]
+                    self._retry_after[fingerprint] = time.time() + delay
+                    self._emit(
+                        "error",
+                        f"生成失败（第 {attempt}/{MAX_GENERATE_ATTEMPTS} 次，{delay:g}s 后重试）："
+                        f"{result.reason}",
+                    )
         return messages
+
+    def _hold_reason(self, fingerprint: str) -> str:
+        """这条消息现在该不该跳过。返回非空字符串表示要跳过。"""
+        decision = self._decisions.get(fingerprint)
+        if decision:
+            return f"已有结论（{decision}）"
+        if self._attempts.get(fingerprint, 0) >= MAX_GENERATE_ATTEMPTS:
+            return "重试次数已用尽"
+        wait_until = self._retry_after.get(fingerprint, 0.0)
+        if wait_until > time.time():
+            return f"退避中（还剩 {wait_until - time.time():.0f}s）"
+        return ""
 
 
 def _memory():
