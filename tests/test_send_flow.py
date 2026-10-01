@@ -16,18 +16,39 @@ import numpy as np
 from wxbot.wechat import input as input_mod
 from wxbot.wechat import vision_client as vc
 
+# 三个区域各用一种底色标识。
+# 早先这里靠"图片高度"猜是哪个区域（height<=60 是标题栏、>200 是聊天区），
+# 但 `pad_for_ocr` 会把扁长区域补成正方形，高度就变了 → 猜测失效、测试假红。
+# 颜色是内容属性，补白不会改变它，比高度可靠。
+COLOR_HEADER = (12, 20, 28)
+COLOR_CHAT = (40, 60, 80)
+COLOR_INPUT = (90, 110, 130)
+
+
+def paint_regions(frame: np.ndarray) -> None:
+    """把测试帧的三个区域涂成不同底色，供假 OCR 识别。"""
+    height, width = frame.shape[:2]
+    panel = int(width * vc.SESSION_LIST_WIDTH_RATIO)
+    frame[int(height * 0.05) : int(height * 0.13), panel : panel + 320] = COLOR_HEADER
+    frame[int(height * 0.14) : int(height * 0.72), panel:] = COLOR_CHAT
+    frame[int(height * 0.76) : int(height * 0.94), panel:] = COLOR_INPUT
+
 
 def fake_ocr(holder: dict):
-    """按区域返回不同文本的假 OCR；holder 可被测试中途修改（模拟切换会话后标题变化）。"""
+    """按区域底色返回不同文本的假 OCR；holder 可被测试中途修改（模拟切换会话后标题变化）。"""
 
     def _ocr(image):
-        height, _width = image.shape[:2]
-        if height <= 60:
+        # 补白用的是区域自身的中位色，所以整张图（补白+内容）的中位色就是区域标识色
+        color = tuple(
+            int(round(float(np.median(image[:, :, channel])))) for channel in range(3)
+        )
+        if color == COLOR_HEADER:
             text = holder.get("header", "")
-        elif height > 200:
-            text = holder.get("chat", "")
-        else:
+        elif color == COLOR_INPUT:
             text = holder.get("input", "")
+        else:
+            text = holder.get("chat", "")
+        height, width = image.shape[:2]
         box = [[10, 5], [90, 5], [90, height - 5], [10, height - 5]]
         return ([[box, text, 0.99]] if text else []), 0.01
 
@@ -37,6 +58,7 @@ def fake_ocr(holder: dict):
 class SendFlowTests(unittest.TestCase):
     def setUp(self):
         self.frame = np.full((641, 882, 3), 240, dtype=np.uint8)
+        paint_regions(self.frame)
         self.calls: list[str] = []
         self.holder = {"header": "", "input": "", "chat": ""}
 

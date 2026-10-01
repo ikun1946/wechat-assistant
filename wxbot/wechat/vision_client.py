@@ -144,6 +144,45 @@ def _is_timestamp_text(text: str) -> bool:
     return bool(re.fullmatch(r"(?:\d{1,2}:\d{2}|昨天|前天|星期[一二三四五六日天]|周[一二三四五六日天])", stripped))
 
 
+# RapidOCR 在预处理时会把输入的**短边**放大到 limit_side_len（默认 736）。
+# 于是一块"扁长"的区域会被成倍放大：标题栏 320x45（长宽比 7:1）实测要 575ms，
+# 而同样内容补白成正方形只要 105ms —— 慢的是凭空多出来的那一大片空白。
+# 比例正常的区域（聊天气泡 1.7:1、会话列表 2.2:1）不受影响。
+_OCR_MAX_ASPECT = 1.7  # 长边 / 短边 的上限
+
+
+def pad_for_ocr(region: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """把过扁/过长的裁剪区补成正方形再送进 OCR。
+
+    补的是**纯色空白**，不含任何文字，不影响识别结果，只是省掉无意义的放大推理。
+    实测（2026-10-01，811x565 窗口）：标题栏 575ms → 105ms。
+
+    返回 `(补白后的图, 左边距, 上边距)`。
+    ⚠ 补白会让 OCR 返回的坐标整体平移 —— **依赖坐标的调用方必须把偏移扣掉**
+    （统一走 `VisionClient._ocr_region(..., need_coords=True)`）。
+    """
+    if region is None or region.size == 0:
+        return region, 0, 0
+    height, width = region.shape[:2]
+    if height == 0 or width == 0:
+        return region, 0, 0
+    long_side, short_side = max(height, width), min(height, width)
+    if long_side <= short_side * _OCR_MAX_ASPECT:
+        return region, 0, 0  # 比例本来就正常，不动它
+    size = long_side
+    top = (size - height) // 2
+    left = (size - width) // 2
+    # 用区域自身的中位色做填充，贴近真实背景（深色/浅色主题都不突兀）。
+    # ⚠ 必须**按通道分别**取中位数：`int(np.median(region))` 会把 RGB 三通道
+    # 混在一起求中位数，深色底 (12,20,28) 会被算成灰色 (20,20,20)。
+    channels = region.shape[2] if region.ndim == 3 else 1
+    fill = tuple(int(np.median(region[:, :, c])) for c in range(channels))
+    canvas = np.empty((size, size, channels), dtype=region.dtype)
+    canvas[:, :] = fill
+    canvas[top : top + height, left : left + width] = region
+    return canvas, left, top
+
+
 def _find_red_badges(panel: np.ndarray) -> list[tuple[int, int, int, int]]:
     """找出面板里像「未读红点」的红色小圆点。
 
@@ -232,6 +271,21 @@ class VisionClient(WeChatClient):
         self._hwnd = window["hwnd"] if window else None
         return window
 
+    def _ocr_region(self, region, *, need_coords: bool = False):
+        """统一的 OCR 入口：先把过扁的区域补成正方形，再送进 OCR。
+
+        `need_coords=True` 时会自动把补白偏移扣掉，返回的坐标仍相对**原始裁剪区**
+        —— 气泡方向判定依赖 center_x，坐标错了会直接导致误判"谁发的"。
+        """
+        padded, left, top = pad_for_ocr(region)
+        result, elapsed = self._ocr(padded)
+        if result and need_coords and (left or top):
+            result = [
+                ([[point[0] - left, point[1] - top] for point in box], text, score)
+                for box, text, score in result
+            ]
+        return result, elapsed
+
     def _grab(self):
         """抓一帧微信窗口（单帧，约 0.2s）。测试可替换此方法来桩掉真实抓屏。"""
         window = self._window()
@@ -278,7 +332,7 @@ class VisionClient(WeChatClient):
 
         height, width = image.shape[:2]
         panel = image[:, : int(width * SESSION_LIST_WIDTH_RATIO)]
-        result, _ = self._ocr(panel)
+        result, _ = self._ocr_region(panel)
         if not result:
             return []
 
@@ -804,7 +858,7 @@ class VisionClient(WeChatClient):
         region = image[int(height * 0.05) : int(height * 0.13), panel_width : panel_width + 320]
         if region.size == 0:
             return ""
-        result, _ = self._ocr(region)
+        result, _ = self._ocr_region(region)
         if not result:
             return ""
         from ..textutil import names_match
@@ -841,7 +895,7 @@ class VisionClient(WeChatClient):
         region = image[int(height * 0.76) : int(height * 0.94), panel_width:]
         if region.size == 0:
             return False
-        result, _ = self._ocr(region)
+        result, _ = self._ocr_region(region)
         if not result:
             return False
         combined = normalize_name(" ".join(str(item[1]) for item in result))
@@ -882,7 +936,9 @@ class VisionClient(WeChatClient):
         region = image[int(height * 0.14) : int(height * 0.72), panel_width:]
         if region.size == 0:
             return []
-        result, _ = self._ocr(region)
+        # ⚠ 这里必须 need_coords=True：气泡方向判定靠 center_x，
+        # 补白平移了坐标却不修正，就会把"我发的"判成"对方发的"→ 重复回复。
+        result, _ = self._ocr_region(region, need_coords=True)
         if not result:
             return []
 
@@ -979,7 +1035,7 @@ class VisionClient(WeChatClient):
         region = image[int(height * 0.14) : int(height * 0.72), panel_width:]
         if region.size == 0:
             return ""
-        result, _ = self._ocr(region)
+        result, _ = self._ocr_region(region)
         if not result:
             return ""
         # 按纵向位置排序（从上到下 = 聊天顺序）
@@ -1001,7 +1057,7 @@ class VisionClient(WeChatClient):
         region = image[int(height * 0.12) : int(height * 0.80), panel_width:]
         if region.size == 0:
             return False
-        result, _ = self._ocr(region)
+        result, _ = self._ocr_region(region)
         if not result:
             return False
         needle = normalize_name(text)[:8]

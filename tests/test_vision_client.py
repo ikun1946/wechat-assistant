@@ -6,7 +6,84 @@ import unittest
 
 import numpy as np
 
-from wxbot.wechat.vision_client import VisionClient, _has_red_badge
+from wxbot.wechat.vision_client import VisionClient, _has_red_badge, pad_for_ocr
+
+
+class PadForOcrTests(unittest.TestCase):
+    """OCR 前的补白处理（v2.6.0 性能优化）。
+
+    背景：RapidOCR 会把输入的**短边**放大到 limit_side_len（默认 736），
+    扁长区域（标题栏 320x45，长宽比 7:1）因此被放大十几倍，
+    实测 575ms → 补白成正方形后只要 105ms。
+    """
+
+    def test_normal_ratio_is_untouched(self):
+        # 1.67 < 1.7，比例本来就正常
+        region = np.zeros((300, 500, 3), dtype=np.uint8)
+        padded, left, top = pad_for_ocr(region)
+        self.assertEqual(padded.shape, region.shape, "比例正常的区域不该被改")
+        self.assertEqual((left, top), (0, 0))
+
+    def test_slightly_flat_region_is_untouched(self):
+        """327x568 的比例是 1.74，只比阈值高一点 —— 仍会补白（阈值按实测定的）。"""
+        region = np.zeros((327, 568, 3), dtype=np.uint8)
+        padded, _, _ = pad_for_ocr(region)
+        self.assertEqual(padded.shape[0], padded.shape[1])
+
+    def test_flat_region_is_padded_to_square(self):
+        region = np.zeros((45, 320, 3), dtype=np.uint8)
+        padded, left, top = pad_for_ocr(region)
+        self.assertEqual(padded.shape[0], padded.shape[1], "应补成正方形")
+        self.assertEqual(padded.shape[0], 320)
+        self.assertEqual((left, top), (0, (320 - 45) // 2))
+
+    def test_fill_keeps_background_colour_per_channel(self):
+        """回归：曾经写成 int(np.median(region))，把 RGB 混在一起求中位数，
+        深色底 (12,20,28) 被算成灰色 (20,20,20) —— 补白颜色必须是区域本身的颜色。"""
+        region = np.zeros((45, 320, 3), dtype=np.uint8)
+        region[:, :] = (12, 20, 28)
+        padded, _, top = pad_for_ocr(region)
+        border = padded[0, 0]
+        self.assertEqual(tuple(int(v) for v in border), (12, 20, 28))
+
+    def test_content_is_preserved_at_reported_offset(self):
+        region = np.zeros((45, 320, 3), dtype=np.uint8)
+        region[:, :] = (10, 10, 10)
+        region[10:20, 100:140] = (255, 255, 255)
+        padded, left, top = pad_for_ocr(region)
+        block = padded[top + 10 : top + 20, left + 100 : left + 140]
+        self.assertEqual(int(block[0, 0, 0]), 255, "白色文字块必须原样保留")
+
+    def test_ocr_region_compensates_coordinates(self):
+        """依赖坐标的调用方（气泡方向判定）必须拿到原始坐标，否则会误判谁发的。"""
+        region = np.zeros((45, 320, 3), dtype=np.uint8)
+
+        def _ocr(image):
+            # 文字在**原始区域**里的位置是 (100, 10)；OCR 看到的是补白后的图，
+            # 所以它返回的坐标会带上补白偏移。补偿后应该还原成 (100, 10)。
+            top = (image.shape[0] - 45) // 2
+            box = [[100, 10 + top], [140, 10 + top], [140, 20 + top], [100, 20 + top]]
+            return [[box, "你好", 0.99]], 0.01
+
+        client = VisionClient(ocr=_ocr, enable_ocr=False)
+        result, _ = client._ocr_region(region, need_coords=True)
+        xs = [point[0] for point in result[0][0]]
+        ys = [point[1] for point in result[0][0]]
+        self.assertEqual(min(xs), 100, "x 坐标应扣掉左边距")
+        self.assertEqual(min(ys), 10, "y 坐标应扣掉上边距")
+
+    def test_ocr_region_without_coords_keeps_raw(self):
+        """不需要坐标的调用方（只取文本）拿到的就是原始值，不做补偿。"""
+        region = np.zeros((45, 320, 3), dtype=np.uint8)
+
+        def _ocr(image):
+            box = [[100, 10], [140, 10], [140, 20], [100, 20]]
+            return [[box, "你好", 0.99]], 0.01
+
+        client = VisionClient(ocr=_ocr, enable_ocr=False)
+        result, _ = client._ocr_region(region)
+        xs = [point[0] for point in result[0][0]]
+        self.assertEqual(min(xs), 100)
 
 
 def fake_ocr_factory(items: list[tuple[str, float, float]]):
