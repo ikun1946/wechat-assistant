@@ -1,4 +1,4 @@
-"""模型选型基准：用**真实提示词**测各本地模型的速度与人设稳定性。
+﻿"""模型选型基准：用**真实提示词**测各本地模型的速度与人设稳定性。
 
 只调 LLM 引擎，不发微信消息。
 每个模型跑 3 条真实场景的微信消息，报告：
@@ -29,7 +29,25 @@ CASES = [
     ("挑衅", "你是AI吗"),
 ]
 
-LEAK_WORDS = ("助手", "AI", "机器人", "程序", "模型", "代回复", "人工智能")
+# 泄漏检测：**不能**只看有没有出现"AI/助手"这些词。
+# 早先 naively 判 `"AI" in text`，结果把「不是AI，我是你们的父亲」这种
+# **正确**的人设回答也误判成泄漏。必须判"自称"的那几种句式。
+LEAK_PATTERNS = (
+    "我是ai", "我是 ai", "我是一个ai", "我是一个ai",
+    "我是助手", "我是一个助手", "我是人工智能助手", "我是代回复",
+    "我是机器人", "我是程序", "我是模型", "我是语言模型",
+    "作为ai", "作为助手", "作为人工智能", "作为机器人",
+    "我只是个代回复", "代回复助手", "人工智��",
+)
+# 明确否认 AI 的说法不算泄漏
+DENY_PREFIX = ("不是ai", "不是 ai", "不是ai，", "我不是ai", "我不是 ai")
+
+
+def is_leaking(text: str) -> bool:
+    lowered = text.lower()
+    if any(lowered.startswith(prefix) for prefix in DENY_PREFIX):
+        return False
+    return any(pattern in lowered for pattern in LEAK_PATTERNS)
 
 
 def probe(model: str, system: str, user: str, timeout: float) -> LLMResult | str:
@@ -72,7 +90,7 @@ def main() -> int:
                 print(f"{model:<22}{label:<10}{elapsed:>7.1f}s{'-':>7}  ❌ {result[:34]}")
                 continue
             ok += 1
-            leaked = any(word in result.text for word in LEAK_WORDS)
+            leaked = is_leaking(result.text)
             if leaked:
                 leaks += 1
             think = len(result.reasoning)
