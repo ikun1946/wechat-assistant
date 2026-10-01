@@ -155,15 +155,17 @@ class _NoWheelFilter(QObject):
     def _scroll_ancestor(obj: QWidget, delta: int) -> bool:
         """把 delta 交给最近的、有可用滚动条的祖先容器。
 
-        方向：Qt 的 WheelEvent 里 delta > 0 表示"向上滚（远离用户）"，
-        对应滚动条值应该**增大**（往下看内容）。
+        ⚠ 方向（v2.6.7 修，用户报「鼠标下滚、页面却往上滚」）：
+        Qt 的 `angleDelta().y() > 0` 表示**滚轮往前推**（向上看），
+        这时应该看**更靠前**的内容 → 滚动条值**减小**。
+        所以这里必须 `value - delta`；早先写成 `value + delta` 方向正好反了 ——
+        滚轮往下拉本该看更靠后的内容，滚动条却减小，页面就往上跑。
 
         注意：不能一遇到有 verticalScrollBar 的控件就返回 —— 例如 QPlainTextEdit
         自己也提供滚动条，但内容不满时 maximum == 0（滚不动），此时应继续往上找。
 
-        ⚠ 更关键：**必须确认滚动条真的动了**。页面已经到底时，
-        `setValue(value + delta)` 会被 Qt 静默钳到 maximum，值根本没变；
-        若此时就返回 True，上层会以为"页面滚过了"，于是把滚轮吞掉，
+        也必须确认滚动条**真的动了**：页面已经到底时 `setValue` 会被 Qt 静默钳位
+        （值没变）。若此时就返回 True，上层会以为「页面滚过了」，于是把滚轮吞掉，
         文本框就永远拿不到滚轮（v2.6.2 实测发现）。
         """
         node: QWidget | None = obj
@@ -176,7 +178,7 @@ class _NoWheelFilter(QObject):
                     scroll_bar = None
                 if scroll_bar is not None and scroll_bar.maximum() > scroll_bar.minimum():
                     before = scroll_bar.value()
-                    scroll_bar.setValue(before + delta)
+                    scroll_bar.setValue(before - delta)
                     if scroll_bar.value() != before:
                         return True
                     # 滚不动（到顶 / 到底）→ 继续往上找别的容器

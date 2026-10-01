@@ -96,7 +96,7 @@ class RunLogWheelTests(unittest.TestCase):
         area.verticalScrollBar().setValue(0)
         inner_before = text.verticalScrollBar().value()
 
-        swallowed = guard.eventFilter(text, _FakeWheel(120))
+        swallowed = guard.eventFilter(text, _FakeWheel(-120))  # -120 = 滚轮下拉
 
         self.assertTrue(swallowed, "页面优先：事件应被吞掉")
         self.assertEqual(

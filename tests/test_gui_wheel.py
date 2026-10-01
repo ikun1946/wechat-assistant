@@ -29,6 +29,13 @@ from PySide6.QtWidgets import (  # noqa: E402
 import wxbot.gui as gui  # noqa: E402
 
 
+# Qt 的 `angleDelta().y() > 0` = 滚轮往前推（向上看），此时应看更靠前的内容，
+# 滚动条值**减小**。所以"往下滚 / 看后面"在 Qt 里是**负值**。
+# v2.6.7 之前测试一直用 +120 并断言值变大 —— 等于把"方向反了"当成正确固化下来了。
+WHEEL_DOWN = -120   # 鼠标往下拉 → 看更靠后的内容 → 滚动条值应该**增大**
+WHEEL_UP = 120      # 鼠标往上推 → 看更靠前的内容 → 滚动条值应该**减小**
+
+
 class _FakeWheel:
     def __init__(self, delta: int):
         self._angle = QPoint(0, delta)
@@ -75,7 +82,7 @@ class WheelGuardTests(unittest.TestCase):
         self.app.processEvents()
         return host, area
 
-    def wheel(self, guard, obj, delta=120):
+    def wheel(self, guard, obj, delta=WHEEL_DOWN):
         return guard.eventFilter(obj, _FakeWheel(delta))
 
     # ---------- 核心回归 ----------
@@ -120,13 +127,18 @@ class WheelGuardTests(unittest.TestCase):
 
     # ---------- 页面到底后才交给文本框 ----------
     def test_text_gets_wheel_when_page_is_at_end(self):
+        """页面已经到底时，滚轮才轮到文本框。
+
+        "到底"= 滚动条在 maximum（正在看内容末尾）。此时**往下滚**
+        （WHEEL_DOWN）已经没东西可看，才算"滚不动"→ 轮得到文本框。
+        """
         host, area = self.build(long_text=True)
         guard = gui._NoWheelFilter(host)
         bar = area.verticalScrollBar()
         bar.setValue(bar.maximum())
         self.app.processEvents()
 
-        passed_through = self.wheel(guard, self.text)
+        passed_through = self.wheel(guard, self.text, WHEEL_DOWN)
 
         self.assertFalse(passed_through, "页面到底后应放行给文本框")
         host.close()
@@ -141,16 +153,16 @@ class WheelGuardTests(unittest.TestCase):
         bar = area.verticalScrollBar()
         bar.setValue(bar.maximum())
         self.app.processEvents()
-        # 从页面内容开始问"页面滚得动吗"：到底时必须回答"滚不动"
+        # 到底时往下滚（已无更靠后的内容）才滚不动
         self.assertFalse(
-            gui._NoWheelFilter._scroll_ancestor(area.widget(), 120),
+            gui._NoWheelFilter._scroll_ancestor(area.widget(), WHEEL_DOWN),
             "页面到底时必须返回 False",
         )
-        # 页面还能滚时才返回 True
+        # 页面还能往下滚时才返回 True
         bar.setValue(bar.maximum() - 200)
         self.app.processEvents()
         self.assertTrue(
-            gui._NoWheelFilter._scroll_ancestor(area.widget(), 120),
+            gui._NoWheelFilter._scroll_ancestor(area.widget(), WHEEL_DOWN),
             "页面还能滚时应返回 True",
         )
         host.close()
@@ -177,13 +189,9 @@ class WheelGuardTests(unittest.TestCase):
         bar = area.verticalScrollBar()
         bar.setValue(300)
         self.app.processEvents()
-        self.wheel(guard, self.text, -120)
+        self.wheel(guard, self.text, WHEEL_UP)
         self.app.processEvents()
-        self.assertEqual(bar.value(), 180, "反向滚动应把页面往上带")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(bar.value(), 180, "往上推应把页面带回更前面的内容")
 
 
 class InstallCoverageTests(unittest.TestCase):
@@ -207,13 +215,13 @@ class InstallCoverageTests(unittest.TestCase):
 
         count = gui.install_wheel_guard(host)
         guard = gui._NoWheelFilter(host)
-        result = guard.eventFilter(content, _FakeWheel(120))
+        result = guard.eventFilter(content, _FakeWheel(WHEEL_DOWN))
         self.assertTrue(result, "页面 widget 上的滚轮必须由过滤器处理")
         self.assertGreater(count, 0, "应至少装了一个过滤器")
         host.close()
 
     def test_page_widget_wheel_moves_scroll_bar(self):
-        """页面 widget 自身收到 wheel 时，过滤器要把滚动条往上推。"""
+        """页面 widget 自身收到 wheel 时，过滤器要往正确方向推滚动条。"""
         from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
         host = QWidget()
@@ -233,10 +241,66 @@ class InstallCoverageTests(unittest.TestCase):
         gui.install_wheel_guard(host)
         guard = gui._NoWheelFilter(host)
         bar = area.verticalScrollBar()
+
+        # 滚轮下拉 → 看到更靠后的内容 → 滚动条值**增大**
         bar.setValue(0)
-        guard.eventFilter(content, _FakeWheel(120))
+        guard.eventFilter(content, _FakeWheel(WHEEL_DOWN))
         self.app.processEvents()
         self.assertGreater(
-            bar.value(), 0, "页面 widget 上的 wheel 应让滚动条动起来"
+            bar.value(), 0, "滚轮下拉应让滚动条增大（页面往下走）"
+        )
+
+        # 滚轮上推 → 看到更靠前的内容 → 滚动条值**减小**
+        before_up = bar.value()
+        guard.eventFilter(content, _FakeWheel(WHEEL_UP))
+        self.app.processEvents()
+        self.assertLess(
+            bar.value(), before_up, "滚轮上推应让滚动条减小（页面往上走）"
         )
         host.close()
+
+    def test_wheel_direction_is_not_inverted(self):
+        """v2.6.7 核心回归：滚轮方向不能反。
+
+        用户报「鼠标往下滚，页面却往上滚」。
+        早先的实现是 `setValue(value + delta)`，而 Qt 里 `angleDelta().y() > 0`
+        是**滚轮往前推**（看更靠前的内容），滚动条值应该**减小** —— 加号正好写反。
+        而且当时的测试全部用 +120 并断言值变大，等于把错误方向固化下来了。
+        """
+        from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
+
+        host = QWidget()
+        area = QScrollArea(host)
+        area.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        filler = QWidget()
+        filler.setFixedHeight(900)
+        layout.addWidget(filler)
+        layout.addWidget(QLabel("底部"))
+        area.setWidget(content)
+        host.resize(400, 200)
+        host.show()
+        self.app.processEvents()
+
+        bar = area.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 100, "前提：页面确实能滚一段")
+
+        # 滚轮往下拉（Qt 里是负值）→ 看更靠后的内容 → 值**增大**
+        bar.setValue(100)
+        gui._NoWheelFilter._scroll_ancestor(content, WHEEL_DOWN)
+        self.assertGreater(
+            bar.value(), 100, "鼠标下滚应该看到更靠后的内容（滚动条值增大）"
+        )
+
+        # 滚轮往上推（Qt 里是正值）→ 看更靠前的内容 → 值**减小**
+        before_up = bar.value()
+        gui._NoWheelFilter._scroll_ancestor(content, WHEEL_UP)
+        self.assertLess(
+            bar.value(), before_up, "鼠标上滚应该看到更靠前的内容（滚动条值减小）"
+        )
+        host.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -284,6 +284,27 @@ Thread (main):    runner.py:154 in stop → Thread.join()
 
 回归测试 `tests/test_runner.py::SaveRestartsRunnerTests`。
 
+## 滚轮方向：Qt 里 `delta > 0` 是"往上推"（v2.6.7 修）
+
+**鼠标往下拉 → Qt 给的是负值**；往上推 → 正值。往下拉要看更靠后的内容，
+滚动条值应该**增大** —— 所以映射必须是 `setValue(before - delta)`。
+
+早先写成 `setValue(before + delta)`，**方向正好反了**：用户报「鼠标下滚、页面却往上滚」。
+
+**为什么一直没被发现**：当时的测试全部用 `+120` 并断言「页面值变大」，
+等于把错误方向当成正确固化下来了 —— 改代码时只看测试全绿就放过。
+**教训：给交互写测试时，要按"用户实际会怎么做"来设计输入，而不是照着当前实现写断言。**
+
+现在约定（`tests/test_gui_wheel.py` 顶部）：
+
+```python
+WHEEL_DOWN = -120   # 鼠标往下拉 → 看更靠后 → 滚动条值**增大**
+WHEEL_UP   = 120    # 鼠标往上推 → 看更靠前 → 滚动条值**减小**
+```
+
+测"页面到底/到顶"时注意方向：滚动条在 maximum（末尾）时，要让它滚不动得用
+**WHEEL_DOWN**（已经没有更靠后的内容了）。`tools/check_gui_wheel.py` 第 10 项专门锁方向。
+
 ## 滚轮过滤器装在哪些控件上（v2.6.3）
 
 `install_wheel_guard` 除了 guarded 类型（下拉框 / 数字框 / 滑块 / 文本框），

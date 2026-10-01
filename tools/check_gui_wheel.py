@@ -21,6 +21,10 @@ from wxbot.config import AppConfig  # noqa: E402
 
 failures: list[str] = []
 
+# Qt 里：+120 = 滚轮往前推（向上看），-120 = 往下拉（看更靠后的内容）
+WHEEL_DOWN = -120
+WHEEL_UP = 120
+
 
 def check(condition: bool, label: str) -> None:
     print(("  ✅ " if condition else "  ❌ ") + label)
@@ -51,8 +55,13 @@ def make_guard(window):
     return gui._NoWheelFilter(window)
 
 
-def wheel_on(guard, widget, delta: int = 120) -> bool:
-    """让过滤器处理一次滚轮：返回 True 表示事件被吞掉（控件不会响应）。"""
+def wheel_on(guard, widget, delta: int = WHEEL_DOWN) -> bool:
+    """让过滤器处理一次滚轮：返回 True 表示事件被吞掉（控件不会响应）。
+
+    ⚠ 方向：Qt 的 `angleDelta().y() > 0` 是**滚轮往前推**（向上看），
+    滚动条值应该**减小**；所以"往下滚"在 Qt 里是**负值**。
+    早先这里用 +120 并断言页面值增大，等于把方向反了当成正确（v2.6.7 修）。
+    """
     return guard.eventFilter(widget, _FakeWheel(delta))
 
 
@@ -113,7 +122,7 @@ def main() -> int:
     if bar is not None:
         bar.setValue(0)
     inner_before = short.verticalScrollBar().value()
-    swallowed = wheel_on(guard, short, 120)
+    swallowed = wheel_on(guard, short, WHEEL_DOWN)
     app.processEvents()
     check(swallowed, "滚轮被吞掉（不让短文本框吃掉）")
     check(
@@ -138,7 +147,7 @@ def main() -> int:
     if bar is not None:
         bar.setValue(0)
     inner_before = inner_bar.value()
-    swallowed = wheel_on(guard, long_text, 120)
+    swallowed = wheel_on(guard, long_text, WHEEL_DOWN)
     app.processEvents()
     check(swallowed, "事件被吞掉：先滚页面，不让文本框抢")
     check(
@@ -156,7 +165,7 @@ def main() -> int:
         bar.setValue(bar.maximum())
     app.processEvents()
     inner_before = inner_bar.value()
-    passed_through = wheel_on(guard, long_text, 120)
+    passed_through = wheel_on(guard, long_text, WHEEL_DOWN)
     app.processEvents()
     check(not passed_through, "过滤器放行（页面到底，滚轮交给文本框）")
     inner_bar.setValue(inner_before + 120)
@@ -181,12 +190,12 @@ def main() -> int:
     app.processEvents()
     check(window.persona_formality.value() == slider_before, "滑块数值未变")
 
-    print("[8] 反向滚动也有效（往回滚）")
+    print("[8] 反向滚动也有效（往上推 → 回到更前面的内容）")
     if bar is not None:
         bar.setValue(300)
-        wheel_on(guard, short, -120)
+        wheel_on(guard, short, WHEEL_UP)
         app.processEvents()
-        check(bar.value() == 180, f"反向滚动生效（{bar.value()}）")
+        check(bar.value() == 180, f"往上推生效（{bar.value()}）")
 
     print("[9] 连续滚动不闪动：同一位置反复滚，行为始终一致")
     if bar is not None:
@@ -195,12 +204,22 @@ def main() -> int:
             bar.setValue(100)
             inner_bar.setValue(0)
             before_page = bar.value()
-            wheel_on(guard, long_text, 120)
+            wheel_on(guard, long_text, WHEEL_DOWN)
             app.processEvents()
             if bar.value() == before_page or inner_bar.value() != 0:
                 stable = False
                 break
         check(stable, "每次都滚页面、文本框始终不动（没有交替接管）")
+
+    print("[10] 方向不能反：下滚看后面、上滚看前面")
+    if bar is not None:
+        bar.setValue(100)
+        wheel_on(guard, short, WHEEL_DOWN)
+        after_down = bar.value()
+        check(after_down > 100, f"鼠标下滚 → 看到更靠后的内容（{after_down} > 100）")
+        wheel_on(guard, short, WHEEL_UP)
+        after_up = bar.value()
+        check(after_up < after_down, f"鼠标上滚 → 看到更靠前的内容（{after_up} < {after_down}）")
 
     window.close()
     app.quit()

@@ -3,4 +3,4 @@
 入口：python -m wxbot status | run | gui | learn | providers | models
 """
 
-__version__ = "2.6.6"
+__version__ = "2.6.7"
