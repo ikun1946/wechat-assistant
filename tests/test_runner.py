@@ -460,5 +460,68 @@ class GenerationRetryTests(unittest.TestCase):
 
 
 
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import wxbot.runner as r_mod
+import wxbot.config as cfg_mod
+from wxbot.config import AppConfig
+from wxbot.wechat.vision_client import VisionClient
+from PySide6.QtWidgets import QApplication
+
+
+class SaveRestartsRunnerTests(unittest.TestCase):
+    """v2.6.4：保存配置后 Runner 用新 cfg —— 用户不用手动重启开关。
+
+    回归背景：用户改模型 + 保存，看到的依然是旧模型。
+    根因：Runner _init_ 时锁定 cfg，运行中不重读。
+    修法：_on_save 检测 Runner 在跑就 stop + 用新 cfg 重建 + 起。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        from pathlib import Path
+        self._cfg_path = Path(self._tmp.name) / "config.toml"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_runner_locks_model_at_construction(self):
+        """Runner 实例化时锁定了 model —— 这是被 bug 依赖的"坏"行为。
+        _on_save 的修复就是绕过它：构造新 Runner。
+        """
+        cfg = AppConfig()
+        cfg.llm.model = "snapshot-model"
+        runner = r_mod.build_default_runner(cfg, client=VisionClient())
+        self.assertEqual(runner._config.llm.model, "snapshot-model")
+        # 改 cfg 不影响已构造的 Runner（这正是 bug 的根因）
+        cfg.llm.model = "completely-different"
+        self.assertEqual(runner._config.llm.model, "snapshot-model")
+
+    def test_rebuilding_runner_picks_up_new_model(self):
+        """模拟 _on_save 末尾的\"停 + 用新 cfg 重建 + 起\"过程。"""
+        original_path = cfg_mod.DEFAULT_CONFIG_PATH
+        cfg_mod.DEFAULT_CONFIG_PATH = self._cfg_path
+        try:
+            from wxbot.config import write_default_config
+            write_default_config(self._cfg_path)
+            cfg = cfg_mod.load_config(self._cfg_path)
+            cfg.llm.model = "old-model"
+            old_runner = r_mod.build_default_runner(cfg, client=VisionClient())
+            self.assertEqual(old_runner._config.llm.model, "old-model")
+
+            cfg.llm.model = "new-model"
+            new_runner = r_mod.build_default_runner(cfg, client=VisionClient())
+            self.assertEqual(new_runner._config.llm.model, "new-model")
+            self.assertIsNot(new_runner, old_runner)
+        finally:
+            cfg_mod.DEFAULT_CONFIG_PATH = original_path
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1724,9 +1724,29 @@ class MainWindow(QMainWindow):
             save_secret_api_key(api_key)
             self.api_key_edit.clear()
             message += "\n\nAPI Key 已保存到本地 secrets.toml（不会提交到版本库）"
-        QMessageBox.information(self, "已保存", message)
+        # 如果 Runner 在跑，配置变了它不会自动重新读模型/超时等 ——
+        # 之前是让用户手动关开关再开（很容易忘掉，体验很差）。
+        # 现在自动 stop + 用最新配置 start，保证换模型不重启程序就生效。
+        restarted = False
         if self._runner is not None and self._runner.running:
-            self._append_run_log("配置已保存；正在运行的循环仍用旧配置，重新启动开关后生效。")
+            try:
+                self._runner.stop(timeout=4.0)
+                self._runner = build_default_runner(
+                    cfg,
+                    on_event=self._bridge.handle,
+                    poll_interval=max(1.0, self.poll_interval_spin.value()),
+                )
+                self._runner.start()
+                restarted = True
+            except Exception as exc:  # noqa: BLE001
+                self._runner = None
+                self.run_switch.setChecked(False)
+                QMessageBox.warning(self, "重启循环失败", str(exc))
+        if restarted:
+            message += "\n\n识别和循环已用新配置重启（无需重启程序）"
+        else:
+            message += "\n\n提示：自动对话总开关关着，新配置下次打开时生效。"
+        QMessageBox.information(self, "已保存", message)
         self._refresh_status()
 
     # ------------------------------------------------------------- 模型 / 厂商
