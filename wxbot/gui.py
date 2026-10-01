@@ -136,6 +136,11 @@ class _NoWheelFilter(QObject):
             return False
         delta = event.angleDelta().y() or event.pixelDelta().y()
         is_text = isinstance(obj, _WHEEL_GUARDED_TEXT_TYPES)
+        # 例外：标了 wheelPriority=internal 的文本框永远自己滚（不应用页面优先）
+        # —— 给实时日志这类"在页面底部、内容不断追加"的视图用，
+        # 否则页面已经到底了再滚轮直接吞掉，体验是「页面动了日志没动」。
+        if is_text and obj.property("wheelPriority") == "internal":
+            return False
         # 页面优先：从**父级**开始找可滚动容器，跳过文本框自己
         # （文本框自带滚动条，从 obj 自身起找就会先命中它，永远滚不到页面）
         start = obj.parentWidget() if is_text else obj
@@ -750,6 +755,9 @@ class MainWindow(QMainWindow):
         self.run_log_view = QPlainTextEdit()
         self.run_log_view.setReadOnly(True)
         self.run_log_view.setMaximumBlockCount(800)
+        # 实时日志是"页面底部 + 一直加新内容" —— 标记 wheelPriority=internal
+        # 让 _NoWheelFilter 走"文本框优先"分支，避免「页面动了日志没动」。
+        self.run_log_view.setProperty("wheelPriority", "internal")
         self.run_log_view.setPlaceholderText(
             "停止状态：打开右侧开关开始识别，或点「立即试一次」做单次识别。\n"
             "启动后这里会逐条显示：识别到的消息、拟回复内容、拦截原因。"
@@ -2042,9 +2050,13 @@ class MainWindow(QMainWindow):
         if not self.run_log_check.isChecked():
             return
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.run_log_view.appendPlainText(f"[{stamp}] {text}")
         scrollbar = self.run_log_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        was_pinned = scrollbar.value() >= scrollbar.maximum() - 2  # 容差 2 点
+        self.run_log_view.appendPlainText(f"[{stamp}] {text}")
+        # 只有用户本来就贴着底（看最新）时，才把新行贴上去；
+        # 否则让他们从历史里自由看。新行还在追加，只是滚到尾巴后面一点就能看到。
+        if was_pinned:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _on_toggle_runner(self) -> None:
         """以编程方式切换运行状态（等价于用户点一下开关）。"""
