@@ -117,18 +117,33 @@ _WHEEL_GUARDED_TEXT_TYPES = (QPlainTextEdit, QTextEdit)
 
 
 class _NoWheelFilter(QObject):
-    """吞掉控件上的滚轮事件，并把滚动量转交给外层可滚动区域。
+    """滚轮一律先滚**外层页面**，页面到底了才给控件自己。
 
     这样既不会出现"悬停在下拉框上整页滚不动"，也不会误改下拉框选中项 / 数字框数值。
+
+    ⚠ 为什么文本框也必须"页面优先"（v2.6.2 修，用户报的闪动 bug）：
+    早先的规则是"文本框内容溢出就放行给它"。但内容是在**光标底下**移动的 ——
+    滚一下页面，光标下就换成了另一个内容溢出的文本框；下一格滚轮它就抢走，
+    页面纹丝不动；再滚一下又变回页面……两个滚动条方向相反地交替接管，
+    视觉上就是"滚动窗口就闪"。
+
+    规则改成**单向**：只要页面还能滚就滚页面，页面到底/到顶了才给文本框。
+    行为固定下来，就不会有交替，也就不会闪。
     """
 
     def eventFilter(self, obj, event):  # noqa: N802 (Qt 命名)
         if event.type() != QEvent.Type.Wheel:
             return False
-        if isinstance(obj, _WHEEL_GUARDED_TEXT_TYPES) and _can_scroll_inside(obj):
-            return False  # 内容溢出，允许在框内滚动
         delta = event.angleDelta().y() or event.pixelDelta().y()
-        self._scroll_ancestor(obj, delta)
+        is_text = isinstance(obj, _WHEEL_GUARDED_TEXT_TYPES)
+        # 页面优先：从**父级**开始找可滚动容器，跳过文本框自己
+        # （文本框自带滚动条，从 obj 自身起找就会先命中它，永远滚不到页面）
+        start = obj.parentWidget() if is_text else obj
+        if self._scroll_ancestor(start, delta):
+            return True
+        # 页面已经到头，才允许在文本框内部滚（日志区这类长内容才看得完）
+        if is_text and _can_scroll_inside(obj):
+            return False
         return True  # 控件自己不再处理
 
     @staticmethod
@@ -140,6 +155,11 @@ class _NoWheelFilter(QObject):
 
         注意：不能一遇到有 verticalScrollBar 的控件就返回 —— 例如 QPlainTextEdit
         自己也提供滚动条，但内容不满时 maximum == 0（滚不动），此时应继续往上找。
+
+        ⚠ 更关键：**必须确认滚动条真的动了**。页面已经到底时，
+        `setValue(value + delta)` 会被 Qt 静默钳到 maximum，值根本没变；
+        若此时就返回 True，上层会以为"页面滚过了"，于是把滚轮吞掉，
+        文本框就永远拿不到滚轮（v2.6.2 实测发现）。
         """
         node: QWidget | None = obj
         while node is not None:
@@ -150,8 +170,11 @@ class _NoWheelFilter(QObject):
                 except (TypeError, RuntimeError):
                     scroll_bar = None
                 if scroll_bar is not None and scroll_bar.maximum() > scroll_bar.minimum():
-                    scroll_bar.setValue(scroll_bar.value() + delta)
-                    return True
+                    before = scroll_bar.value()
+                    scroll_bar.setValue(before + delta)
+                    if scroll_bar.value() != before:
+                        return True
+                    # 滚不动（到顶 / 到底）→ 继续往上找别的容器
             node = node.parentWidget()
         return False
 

@@ -126,7 +126,7 @@ def main() -> int:
             f"外层页面照常滚动（scrollbar={bar.value()}/{bar.maximum()}）",
         )
 
-    print("[4] 长文本框：内容溢出时允许在框内滚动")
+    print("[4] 长文本框内容溢出时：仍然先滚页面（回归「滚动窗口就闪」）")
     long_text = window.persona_edit
     long_text.setPlainText("\n".join(f"第{i}行内容" for i in range(1, 60)))
     app.processEvents()
@@ -135,19 +135,38 @@ def main() -> int:
         inner_bar.maximum() > 0,
         f"长文本框内容确实溢出（可滚范围 0~{inner_bar.maximum()}）",
     )
+    if bar is not None:
+        bar.setValue(0)
+    inner_before = inner_bar.value()
+    swallowed = wheel_on(guard, long_text, 120)
+    app.processEvents()
+    check(swallowed, "事件被吞掉：先滚页面，不让文本框抢")
+    check(
+        inner_bar.value() == inner_before,
+        f"文本框自身没有滚动（{inner_before}）",
+    )
+    if bar is not None:
+        check(
+            bar.value() > 0,
+            f"页面滚动了（scrollbar={bar.value()}/{bar.maximum()}）",
+        )
+
+    print("[5] 页面已经到底：才交给长文本框自己滚")
+    if bar is not None:
+        bar.setValue(bar.maximum())
+    app.processEvents()
+    inner_before = inner_bar.value()
     passed_through = wheel_on(guard, long_text, 120)
     app.processEvents()
-    check(not passed_through, "过滤器放行（滚轮交给文本框自己处理）")
-    # 直接驱动文本框自身的滚动条，确认它具备滚动能力
-    inner_before = inner_bar.value()
-    inner_bar.setValue(inner_bar.value() + 120)
+    check(not passed_through, "过滤器放行（页面到底，滚轮交给文本框）")
+    inner_bar.setValue(inner_before + 120)
     app.processEvents()
     check(
         inner_bar.value() > inner_before,
         f"文本框自身可滚动（{inner_before} -> {inner_bar.value()}）",
     )
 
-    print("[5] 悬停复选框：不受影响")
+    print("[6] 悬停复选框：不受影响")
     box_state = window.require_mention_check.isChecked()
     wheel_on(guard, window.require_mention_check, 120)
     app.processEvents()
@@ -156,18 +175,32 @@ def main() -> int:
         "复选框状态未受影响",
     )
 
-    print("[6] 滑块：数值不应被滚轮改变")
+    print("[7] 滑块：数值不应被滚轮改变")
     slider_before = window.persona_formality.value()
     wheel_on(guard, window.persona_formality, 120)
     app.processEvents()
     check(window.persona_formality.value() == slider_before, "滑块数值未变")
 
-    print("[7] 反向滚动也有效（往回滚）")
+    print("[8] 反向滚动也有效（往回滚）")
     if bar is not None:
         bar.setValue(300)
         wheel_on(guard, short, -120)
         app.processEvents()
         check(bar.value() == 180, f"反向滚动生效（{bar.value()}）")
+
+    print("[9] 连续滚动不闪动：同一位置反复滚，行为始终一致")
+    if bar is not None:
+        stable = True
+        for step in range(6):
+            bar.setValue(100)
+            inner_bar.setValue(0)
+            before_page = bar.value()
+            wheel_on(guard, long_text, 120)
+            app.processEvents()
+            if bar.value() == before_page or inner_bar.value() != 0:
+                stable = False
+                break
+        check(stable, "每次都滚页面、文本框始终不动（没有交替接管）")
 
     window.close()
     app.quit()
