@@ -8,10 +8,18 @@ from __future__ import annotations
 
 import sys
 import traceback
+from ctypes import wintypes
 from collections import deque
 
 try:
-    from PySide6.QtCore import QEvent, QObject, Qt, QThread, Signal
+    from PySide6.QtCore import (
+    QAbstractNativeEventFilter,
+    QEvent,
+    QObject,
+    Qt,
+    QThread,
+    Signal,
+)
     from PySide6.QtWidgets import (
         QAbstractSpinBox,
         QApplication,
@@ -26,6 +34,7 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPlainTextEdit,
         QProgressBar,
@@ -34,6 +43,7 @@ try:
         QSlider,
         QSpinBox,
         QStackedWidget,
+        QSystemTrayIcon,
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
@@ -198,6 +208,31 @@ def _can_scroll_inside(widget: QWidget) -> bool:
     return bar is not None and bar.maximum() > bar.minimum()
 
 
+# ---- 托盘与全局热键 ----
+TRAY_UID = 0x7731
+HOTKEY_ESTOP_ID = 0xB001
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """把 Windows 的 WM_HOTKEY 消息转给窗口处理。"""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+
+    def nativeEventFilter(self, event_type, message):  # noqa: N802 (Qt 命名)
+        try:
+            from .tray import WM_HOTKEY
+
+            if event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_HOTKEY and (msg.wParam & 0xFFFF) == HOTKEY_ESTOP_ID:
+                    self._window._emergency_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        return False, 0
+
+
 def install_wheel_guard(widget: QWidget) -> int:
     """给 widget 及其所有子控件装上滚轮过滤，返回安装数量。
 
@@ -225,8 +260,7 @@ def install_wheel_guard(widget: QWidget) -> int:
         count += 1
     return count
 
-NAV_ITEMS = (
-    ("run", "◉", "运行", "控制自动对话的启停，查看识别与回复情况"),
+NAV_ITEMS = (    ("run", "◉", "运行", "控制自动对话的启停，查看识别与回复情况"),
     ("reply", "≈", "回复与速度", "调整拟人化延迟与限流，配置关键词规则"),
     ("persona", "✧", "人设", "AI 是谁、怎么说话——决定回复像不像你"),
     ("model", "◈", "模型", "选择厂商与模型，逐模型配置上下文 / 模态 / 思考等级"),
@@ -471,9 +505,31 @@ class MainWindow(QMainWindow):
         self._bridge.event.connect(self._on_runner_event)
         self._loading_learned = False
         self._base_cfg = AppConfig()
+        # 常驻应用：托盘 + 全局急停热键
+        self._tray = None
+        self._tray_run_action = None
+        self._really_quit = False
+        self._hotkey_hwnd = None
+        self._native_filter = None
+        self._first_run_notice = ""
         self._build_ui()
         self._load_into_form()
         self._refresh_status()
+        self._build_tray()
+        self._setup_hotkey()
+        if self._first_run_notice:
+            self._append_run_log(self._first_run_notice)
+            try:
+                from .tray import show_tray_bubble
+
+                show_tray_bubble(
+                    int(self.winId()),
+                    TRAY_UID,
+                    "已生成默认配置",
+                    "首次运行已自动创建 config.toml，请检查后保存。",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -1558,7 +1614,19 @@ class MainWindow(QMainWindow):
         try:
             cfg = load_config()
         except ConfigError as exc:
-            QMessageBox.information(self, "提示", f"读取配置失败，将展示默认值：\n{exc}")
+            # 首次运行（尤其是打包后的 exe）根本没有 config.toml。
+            # 早先这里弹模态框，**启动就被一个"提示"挡住**，看起来像程序坏了。
+            # 现在自动写一份默认配置，并只在运行日志里记一行，不打断启动。
+            try:
+                DEFAULT_CONFIG_PATH.write_text(
+                    dump_config_text(AppConfig()), encoding="utf-8"
+                )
+                self._first_run_notice = (
+                    f"首次运行：已在 {DEFAULT_CONFIG_PATH} 生成默认配置。"
+                    f"请到各页检查后再点「保存配置」。"
+                )
+            except OSError as write_err:
+                self._first_run_notice = f"读取配置失败（{exc}），且无法写入新配置：{write_err}"
             cfg = AppConfig()
         self._base_cfg = cfg
         self._populate(cfg)
@@ -2249,13 +2317,169 @@ class MainWindow(QMainWindow):
             self.mode_combo.setEnabled(True)
             self.poll_interval_spin.setEnabled(True)
         self._restyle_pills()
+        self._sync_tray_action()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
-        """关闭窗口前确保后台循环停下来，避免留下游离线程。"""
+        """关窗口 = 收进托盘（常驻应用），不是退出。
+
+        真正退出走托盘菜单的「退出」，或按 Ctrl+Q。
+        """
+        if self._tray is not None and not self._really_quit:
+            # 忽略这次关闭，隐藏窗口继续在托盘常驻
+            event.ignore()
+            self.hide()
+            return
+        self._teardown()
+        super().closeEvent(event)
+
+    def _teardown(self) -> None:
+        """真正退出前的清理：注销热键、停循环、移除托盘图标。"""
+        if self._hotkey_hwnd:
+            try:
+                from .tray import unregister_hotkey
+
+                unregister_hotkey(int(self._hotkey_hwnd), HOTKEY_ESTOP_ID)
+            except Exception:  # noqa: BLE001
+                pass
+            self._hotkey_hwnd = None
+        if self._native_filter is not None:
+            try:
+                QApplication.instance().removeNativeEventFilter(self._native_filter)
+            except Exception:  # noqa: BLE001
+                pass
+            self._native_filter = None
         if self._runner is not None and self._runner.running:
             self._runner.stop()
-            self._runner = None
-        super().closeEvent(event)
+        self._runner = None
+        if self._tray is not None:
+            self._tray.hide()   # Qt 会自己发 NIM_DELETE
+            self._tray = None
+
+    def _setup_hotkey(self) -> bool:
+        """注册全局急停热键（Ctrl+Alt+Q）。
+
+        任何时候按一下立刻停止自动回复 —— 这个程序会代替用户往微信打字，
+        必须有一个不要求切窗口、不抢焦点的刹车。
+        """
+        try:
+            from .tray import MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_Q, register_hotkey
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            hwnd = int(self.winId())
+        except Exception:  # noqa: BLE001
+            return False
+        ok = register_hotkey(
+            hwnd, HOTKEY_ESTOP_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_Q
+        )
+        if ok:
+            self._hotkey_hwnd = hwnd
+            self._native_filter = _HotkeyFilter(self)
+            QApplication.instance().installNativeEventFilter(self._native_filter)
+            self._append_run_log("全局急停热键已启用：Ctrl+Alt+Q")
+        else:
+            # 被别的软件占用是很常见的，不该因此让程序起不来
+            self._append_run_log(
+                "⚠ 全局急停热键（Ctrl+Alt+Q）注册失败，可能被其他软件占用；"
+                "仍可用托盘菜单或运行页开关来停止。"
+            )
+        return ok
+
+    # ------------------------------------------------------------- 托盘
+    def _build_tray(self) -> None:
+        """建托盘图标 + 菜单。失败不影响主窗口（老系统可能不支持）。"""
+        try:
+            from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+        except Exception:  # noqa: BLE001
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        # 内存里画一个图标，省掉外部 .ico（打包时少一个坑）
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor("#5b8cff"))
+        painter.setPen(QColor("#ffffff"))
+        painter.drawRoundedRect(2, 2, 60, 60, 16, 16)
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(34)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "微")
+        painter.end()
+
+        icon = QIcon(pixmap)
+        self.setWindowIcon(icon)
+
+        self._tray = QSystemTrayIcon(icon, self)
+        menu = QMenu()
+
+        self._tray_run_action = QAction("启动自动回复", self)
+        self._tray_run_action.triggered.connect(self._on_toggle_runner)
+        menu.addAction(self._tray_run_action)
+
+        show_action = QAction("显示主界面", self)
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addAction(show_action)
+
+        menu.addSeparator()
+        quit_action = QAction("退出", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self._quit_app)
+        menu.addAction(quit_action)
+
+        self._tray.setToolTip("微信自动回复助手")
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.messageClicked.connect(self._show_from_tray)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        self._really_quit = True
+        self._teardown()
+        QApplication.quit()
+
+    def _emergency_stop(self) -> None:
+        """全局急停：立刻停止自动回复。不弹窗、不抢焦点。"""
+        was_running = self._runner is not None and self._runner.running
+        self.run_switch.setChecked(False, animate=False)
+        self._on_run_switch(False)
+        if was_running:
+            self._append_run_log("🚨 急停热键触发：已立即停止自动回复")
+        try:
+            from .journal import Journal
+
+            Journal().log("emergency_stop", via="global_hotkey")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from .tray import show_tray_bubble
+
+            show_tray_bubble(
+                int(self.winId()),
+                TRAY_UID,
+                "已急停",
+                "自动回复已停止，检查无误后再重新启动。",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _sync_tray_action(self) -> None:
+        """托盘菜单文字跟着运行状态走。"""
+        if self._tray_run_action is not None:
+            running = self._runner is not None and self._runner.running
+            self._tray_run_action.setText("停止自动回复" if running else "启动自动回复")
 
     def _refresh_status(self) -> None:
         engines = {"rules": "关键词规则", "llm": "大模型"}

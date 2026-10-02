@@ -14,9 +14,26 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
-SECRETS_PATH = PROJECT_ROOT / "secrets.toml"
-DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _app_dir() -> Path:
+    """配置 / 数据 / 密钥放在哪。
+
+    打包成 exe 后，程序文件在 PyInstaller 的临时解包目录里（会随退出被删），
+    **必须**把用户数据放到 exe 旁边，否则配置和聊天记忆每次启动都会丢。
+    源码运行时就是项目根目录，行为不变。
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return PROJECT_ROOT
+
+
+APP_DIR = _app_dir()
+DEFAULT_CONFIG_PATH = APP_DIR / "config.toml"
+SECRETS_PATH = APP_DIR / "secrets.toml"
+DATA_DIR = APP_DIR / "data"
 
 
 class ConfigError(Exception):

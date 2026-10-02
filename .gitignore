@@ -11,7 +11,10 @@ __pycache__/
 build/
 dist/
 out/
-*.spec
+build/
+dist/
+*.spec.tmp
+# 注意：wxbot.spec 是要入库的（构建配置），所以只忽略 wxbot.spec 之外的临时 spec
 
 # 本地配置与私密数据（可能包含个人白名单、API Key、聊天记忆）
 config.toml

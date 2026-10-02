@@ -15,6 +15,8 @@ from pathlib import Path
 
 SKIP_DIRS = {".venv", "logs", "__pycache__", "data", ".git", ".idea", ".pytest_cache"}
 SKIP_FILES = {"config.toml.bak", "secrets.toml", ".env"}
+# PyInstaller 的构建产物：体积巨大且能随时重建，不进快照
+SKIP_DIRS |= {"build", "dist", "dist_debug", "build_debug"}
 
 
 def main() -> int:

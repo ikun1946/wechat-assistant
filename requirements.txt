@@ -13,5 +13,8 @@ pywinauto>=0.6.9
 # 图形界面：
 pyside6-essentials>=6.8
 #
+# 打包成单文件 exe（只在构建 Windows 程序时需要，见 tools\build_exe.bat）：
+pyinstaller>=6.22
+#
 # 后续按需：
 # pyperclip>=1.9            # 剪贴板（发送中文时用粘贴更稳）
