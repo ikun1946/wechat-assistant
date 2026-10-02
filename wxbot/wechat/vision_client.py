@@ -253,18 +253,32 @@ class VisionClient(WeChatClient):
         self._seen_incoming: dict[str, list[tuple[str, float]]] = {}
         self._last_replied_text: dict[str, str] = {}
         self._claimed_text: dict[str, str] = {}
+        # OCR 引擎起不来的真实原因（打包场景下这行信息是救命稻草）
+        self.ocr_error: str = ""
+        self.ocr_traceback: str = ""
         self._refresh_ocr()
 
     # ---------- 基础设施 ----------
     def _refresh_ocr(self) -> None:
+        """初始化 OCR 引擎。
+
+        ⚠ 失败原因**必须留下来**（`self.ocr_error`）。早先这里 `except Exception: pass`
+        一样吞掉，报给用户的只有"请确认已安装 rapidocr-onnxruntime"这种毫无信息量的
+        提示 —— 打包成 exe 后 onnxruntime 加载失败时，根本无从下手。
+        """
         if self._ocr is not None or not self._enable_ocr:
             return
         try:
             from rapidocr_onnxruntime import RapidOCR
 
             self._ocr = RapidOCR()
-        except Exception:
+            self.ocr_error = ""
+        except Exception as exc:  # noqa: BLE001 - 真的要留住原因
             self._ocr = None
+            self.ocr_error = f"{type(exc).__name__}: {exc}"
+            import traceback
+
+            self.ocr_traceback = traceback.format_exc()
 
     def _window(self) -> dict | None:
         window = find_main_window()
@@ -311,7 +325,10 @@ class VisionClient(WeChatClient):
         if not ready:
             return False, reason
         if self._ocr is None:
-            return False, "OCR 引擎不可用（请确认已安装 rapidocr-onnxruntime）"
+            # 把真实原因带出去，别只说一句"请确认已安装"（打包成 exe 时多半是
+            # onnxruntime 的 DLL 没打进去，用户看到那句话完全无从下手）
+            detail = f"：{self.ocr_error}" if self.ocr_error else ""
+            return False, f"OCR 引擎不可用{detail}"
         return True, "ok"
 
     def capture(self) -> np.ndarray | None:

@@ -517,6 +517,7 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self._build_tray()
         self._setup_hotkey()
+        self._log_startup_diagnostics()
         if self._first_run_notice:
             self._append_run_log(self._first_run_notice)
             try:
@@ -2386,6 +2387,39 @@ class MainWindow(QMainWindow):
         return ok
 
     # ------------------------------------------------------------- 托盘
+    def _log_startup_diagnostics(self) -> None:
+        """启动时把关键依赖状态写进审计日志。
+
+        打包成 exe 后出了问题（比如 onnxruntime 没打进去），界面上只会闪一句
+        "OCR 引擎不可用"，截图也不好抓。写进 logs/journal.jsonl 才是真正能查的。
+        """
+        try:
+            from .wechat.vision_client import VisionClient
+
+            client = self._get_vision_client()
+            ocr_ok = getattr(client, "_ocr", None) is not None
+            import sys as _sys
+
+            from .tray import is_frozen
+
+            Journal().log(
+                "startup_diagnostics",
+                frozen=is_frozen(),
+                python=_sys.version.split()[0],
+                executable=_sys.executable,
+                ocr_ok=ocr_ok,
+                ocr_error=getattr(client, "ocr_error", ""),
+                ocr_traceback=(getattr(client, "ocr_traceback", "") or "")[-800:],
+                config_path=str(DEFAULT_CONFIG_PATH),
+                hotkey=self._hotkey_hwnd is not None,
+                tray=self._tray is not None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                Journal().log("startup_diagnostics", failed=str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+
     def _build_tray(self) -> None:
         """建托盘图标 + 菜单。失败不影响主窗口（老系统可能不支持）。"""
         try:
@@ -2589,9 +2623,15 @@ class MainWindow(QMainWindow):
 
 
 def _log_crash(exc: BaseException) -> None:
-    """pythonw 启动时没有控制台，把异常写到 logs/gui_error.log 方便排查。"""
+    """pythonw / 打包后的 exe 没有控制台，把异常写到日志里方便排查。
+
+    ⚠ 用 `APP_DIR`（exe 所在目录）而不是 `PROJECT_ROOT`：冻结后 `PROJECT_ROOT`
+    在 PyInstaller 的临时解包目录里，程序一退出就没了，报错根本留不住。
+    """
     try:
-        path = PROJECT_ROOT / "logs" / "gui_error.log"
+        from .config import APP_DIR
+
+        path = APP_DIR / "logs" / "gui_error.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(traceback.format_exception(exc)), encoding="utf-8")
     except Exception:

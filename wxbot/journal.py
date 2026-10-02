@@ -1,6 +1,11 @@
 """本地 JSONL 审计日志：所有决策与动作可回溯。
 
-一行一个 JSON 对象，只追加、不改写。默认写入项目根目录 logs/journal.jsonl。
+一行一个 JSON 对象，只追加、不改写。默认写入**程序所在目录**的
+logs/journal.jsonl。
+
+⚠ 必须用 `APP_DIR` 而不是 `PROJECT_ROOT`：打包成 exe 后，
+`__file__` 落在 PyInstaller 的临时解包目录里，程序一退出那个目录就被删，
+日志会**全部丢失**。`APP_DIR` 在冻结后指向 exe 所在目录（见 config._app_dir）。
 """
 
 from __future__ import annotations
@@ -9,9 +14,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from .config import PROJECT_ROOT
+from .config import APP_DIR
 
-DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "journal.jsonl"
+DEFAULT_JOURNAL_PATH = APP_DIR / "logs" / "journal.jsonl"
 
 
 class Journal:

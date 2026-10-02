@@ -44,34 +44,42 @@
 > 早先「保存配置」只写磁盘、不通知运行中的循环，必须手动关开关再开才生效。
 > 现在是热更新 —— 换模型不用重启程序，循环也不会被打断。
 
-## 打包成 Windows 单文件程序
+## 打包成 Windows 桌面应用
 
-构建好的程序在 `dist\微信自动回复助手.exe`（约 114 MB，单文件、**无控制台窗口**）。
-**双击即用**，不需要装 Python。
-
-自己重新构建：
+构建产物：`dist\微信自动回复助手\`（一个文件夹，约 330 MB）。
+桌面快捷方式由 `tools\make_shortcut.py` 创建，**点它启动**。
 
 ```powershell
-tools\build_exe.bat          # 或者：
-uv pip install pyinstaller
-.venv\Scripts\python -m PyInstaller wxbot.spec --noconfirm --clean
+tools\build_exe.bat                                     # 打包
+.venv\Scripts\python.exe tools\make_shortcut.py          # 桌面图标
+.venv\Scripts\python.exe tools\make_shortcut.py --startup  # 顺便开机自启
+.venv\Scripts\python.exe tools\make_shortcut.py --remove   # 删除图标
 ```
 
-### exe 的行为和源码版不一样的地方（都是有意为之）
+### 为什么是"目录版"而不是"单文件 exe"
+
+单文件 exe 每次启动都把整个包解到 `%TEMP%`，实测有两个硬伤：
+
+1. **OCR 直接起不来**。界面只显示「OCR 引擎不可用（请确认已安装 rapidocr-onnxruntime）」，
+   但真实原因是解包后 `onnxruntime.dll` 与 `onnxruntime_pybind11_state.pyd` 互相找不到，
+   `import` 报 "DLL load failed"——源码明明装好了。
+2. 启动慢 1~2 秒。
+
+目录版保持原有包结构，依赖加载正常、启动也快。代价是分发时是整个文件夹（压缩一下即可）。
+
+> **排查打包问题的姿势**：程序启动时会往 `logs\journal.jsonl` 写一条
+> `startup_diagnostics`，里面有 `ocr_ok` / `ocr_error` / `ocr_traceback` / `hotkey` / `tray`。
+> 界面上的提示刻意做得短，真因都在这里 —— 这个字段就是为此加的。
+
+### 使用行为
 
 | | 说明 |
 | --- | --- |
-| **配置 / 数据在 exe 旁边** | `config.toml`、`data\`（聊天记忆、学习库、日志）都写在 **exe 所在目录**，不在临时解包目录里。所以**升级 exe 不会丢数据**，把 exe 整个删了才会 |
-| **首次运行自动生成配置** | 没有 `config.toml` 时自动写一份默认值，**不再弹模态框挡住窗口**（早期版本一启动就弹"提示"，看起来像程序坏了）。旁边还放了一份 `config.example.toml` 供对照 |
-| **关窗口 = 收进托盘** | 点右上角 ✕ 只是隐藏，程序继续在托盘常驻。真正退出用**托盘右键 → 退出**，或 `Ctrl+Q` |
+| **配置 / 数据在应用目录** | `config.toml`、`data\`（聊天记忆、学习库、日志）都写在**应用文件夹里**，不在临时目录。升级不会丢数据 |
+| **首次运行自动生成配置** | 没有 `config.toml` 就自动写一份默认值，**不弹窗挡窗**。旁边另有 `config.example.toml` 供对照 |
+| **关窗口 = 收进托盘** | 点右上角 ✕ 只是隐藏，程序继续常驻。真正退出用**托盘右键 → 退出**或 `Ctrl+Q` |
 | **托盘菜单** | 右键图标：启动/停止自动回复、显示主界面、退出 |
-| **全局急停热键 `Ctrl+Alt+Q`** | 任何时候按一下**立刻停止自动回复**（不切窗口、不抢焦点）。这个程序会代替你往微信打字，必须有一个不依赖"先切到本程序"的刹车；触发时还会写一条 `emergency_stop` 审计日志 |
-
-热键被别的软件占用时**不会**导致程序起不来，只会在运行日志里提示你，改用托盘菜单或运行页开关即可。
-
-> 想开机自启：把 exe 复制到 `shell:startup`（`Win+R` 输入即可打开那个文件夹），或用「任务计划程序」。
-
-> 想让源码版和 exe 用同一份配置：把 `dist\config.toml` 复制回项目根目录覆盖即可。
+| **全局急停 `Ctrl+Alt+Q`** | 任何时候按一下**立刻停止自动回复**（不切窗口、不抢焦点），并写一条 `emergency_stop` 审计日志。热键被占用时只在日志里提示，不影响启动 |
 
 ## 性能
 
